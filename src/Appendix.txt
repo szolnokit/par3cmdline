@@ -91,6 +91,29 @@ It requires temporary buffer to keep the block data.
 
 
 
+#### Cauchy Matrix Packet
+
+ For the non-zero elements of the matrix, x_I should start from 0.
+No need to use "I+1" for x_I.
+
+-------------------------------------------------------------------------------
+Old definition was below.
+
+ Specifically, it is the multiplicative inverse of x_I-y_R,
+where x_I is the Galois field element with the same bit pattern as binary integer I+1
+and y_R is the Galois field element associated with the binary integer MAX-R,
+where MAX is the maximum binary unsigned integer value with the same size as the Galois field.
+
+-------------------------------------------------------------------------------
+New definition is below.
+
+ Specifically, it is the multiplicative inverse of x_I-y_R,
+where x_I is the Galois field element with the same bit pattern as binary integer I
+and y_R is the Galois field element associated with the binary integer MAX-R,
+where MAX is the maximum binary unsigned integer value with the same size as the Galois field.
+
+
+
 #### File Packet
 
  It will be possible to use other fingerprint hashes as options in future.

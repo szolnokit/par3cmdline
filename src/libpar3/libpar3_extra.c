@@ -74,6 +74,47 @@ static int check_matrix_packet(PAR3_CTX *par3_ctx)
 			par3_ctx->matrix_packet_offset = offset;
 			return -1;
 
+		// Sparse Random Matrix Packet (SPX = extended block count variant)
+		} else if ( (memcmp(packet_type, "PAR SPA\0", 8) == 0)
+					|| (memcmp(packet_type, "PAR SPX\0", 8) == 0) ){
+			uint64_t first_num, last_num, max_num, nnz, seed;
+
+			if (packet_size < 88){	// 48 header + 40 body
+				printf("Sparse Random Matrix Packet is too small (%"PRIu64" bytes).\n", packet_size);
+				return RET_LOGIC_ERROR;
+			}
+			memcpy(&first_num, buf + offset + 48, 8);
+			memcpy(&last_num, buf + offset + 56, 8);
+			memcpy(&max_num, buf + offset + 64, 8);
+			memcpy(&nnz, buf + offset + 72, 8);
+			memcpy(&seed, buf + offset + 80, 8);
+			if (par3_ctx->noise_level >= 1){
+				printf("Sparse Random Matrix Packet:\n");
+				printf("Index of first input block       = %"PRIu64"\n", first_num);
+				printf("Index of last input block plus 1 = %"PRIu64"\n", last_num);
+				printf("Max number of recovery blocks    = %"PRIu64"\n", max_num);
+				printf("Non-zeros per input block        = %"PRIu64"\n", nnz);
+				printf("RNG seed                         = 0x%"PRIx64"\n", seed);
+				printf("\n");
+			}
+			if (first_num != 0 || last_num != 0){
+				printf("Compatibility issue: Sparse Matrix input range\n");
+				return RET_LOGIC_ERROR;
+			}
+			if ( (par3_ctx->ecc_method != 0) && (par3_ctx->ecc_method != 2) ){
+				printf("Compatibility issue: Error Correction Codes is different.\n");
+				return RET_INVALID_COMMAND;
+			}
+			par3_ctx->ecc_method = 2;
+			if (memcmp(packet_type, "PAR SPX\0", 8) == 0)
+				par3_ctx->ecc_extended = 1;
+			par3_ctx->max_recovery_block = max_num;
+			par3_ctx->sparse_max_recovery = max_num;
+			par3_ctx->sparse_nnz = nnz;
+			par3_ctx->sparse_seed = seed;
+			par3_ctx->matrix_packet_offset = offset;
+			return -1;
+
 		} else if (memcmp(packet_type, "PAR FFT\0", 8) == 0){	// FFT Matrix Packet
 			int8_t shift_num;
 			uint32_t extra_num;
@@ -83,11 +124,12 @@ static int check_matrix_packet(PAR3_CTX *par3_ctx)
 			memcpy(&first_num, buf + offset + 48, 8);
 			memcpy(&last_num, buf + offset + 56, 8);
 			shift_num = buf[offset + 64];	// convert to signed integer
-			if ( (shift_num >= 0) && (shift_num <= 15) ){
-				max_num = (uint64_t)1 << shift_num;
-			} else {
-				max_num = 32768;
+			if ( (shift_num < 0) || (shift_num > 15) ){
+				printf("FFT Matrix Packet: High Rate / unsupported shift value (%d).\n", shift_num);
+				printf("This version supports only Low Rate FFT (shift 0..15).\n");
+				return RET_LOGIC_ERROR;
 			}
+			max_num = (uint64_t)1 << shift_num;
 			extra_num = 0;
 			if ((packet_size > 65) && (packet_size <= 69)){	// Read 1 ~ 4 bytes of the last field
 				memcpy(&extra_num, buf + offset + 65, packet_size - 65);

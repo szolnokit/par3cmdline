@@ -417,7 +417,7 @@ int par3_repair(PAR3_CTX *par3_ctx, char *temp_path)
 			if (ret != 0)
 				return ret;
 
-			if (par3_ctx->ecc_method & 1){	// Cauchy Reed-Solomon Erasure Codes
+			if (par3_ctx->ecc_method & 3){	// Cauchy or Sparse Reed-Solomon Erasure Codes
 				// Construct matrix for Reed-Solomon Codes, and solve linear equation.
 				ret = rs_compute_matrix(par3_ctx, block_count - block_available);
 				if (ret != 0)

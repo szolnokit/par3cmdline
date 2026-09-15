@@ -28,6 +28,8 @@ add_library(libpar3
     reedsolomon8.c
     reedsolomon.c
     repair.c
+    simd.c
+    sparse.c
     verify.c
     verify_check.c
     write.c
@@ -36,3 +38,15 @@ add_library(libpar3
 )
 
 target_link_libraries(libpar3 PRIVATE blake3 leopard platform)
+
+# Multithreaded encoding/decoding
+find_package(OpenMP)
+if(OpenMP_C_FOUND)
+    # Apply the raw flag; the imported target's generator expression is not
+    # reliably applied by the Visual Studio generator.
+    separate_arguments(PAR3_OPENMP_C_FLAGS NATIVE_COMMAND "${OpenMP_C_FLAGS}")
+    target_compile_options(libpar3 PRIVATE ${PAR3_OPENMP_C_FLAGS})
+    if(OpenMP_C_LIB_NAMES)
+        target_link_libraries(libpar3 PRIVATE ${OpenMP_C_LIBRARIES})
+    endif()
+endif()

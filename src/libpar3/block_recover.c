@@ -11,6 +11,7 @@
 #include "galois.h"
 #include "hash.h"
 #include "reedsolomon.h"
+#include "sparse.h"
 
 
 /*
@@ -38,8 +39,8 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 	uint8_t gf_size;
 	int galois_poly, *lost_id, *recv_id;
 	int block_count, block_index;
-	int lost_index, ret;
-	int progress_old, progress_now, progress_step;
+	int lost_index, ret, read_count;
+	int progress_old, progress_now, progress_step, progress_denom;
 	uint32_t file_count, file_index, file_prev;
 	uint32_t chunk_index, chunk_num;
 	size_t slice_size;
@@ -93,6 +94,13 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 	sprintf(temp_path, "par3_%02X%02X%02X%02X%02X%02X%02X%02X_",
 			par3_ctx->set_id[0], par3_ctx->set_id[1], par3_ctx->set_id[2], par3_ctx->set_id[3],
 			par3_ctx->set_id[4], par3_ctx->set_id[5], par3_ctx->set_id[6], par3_ctx->set_id[7]);
+
+	// Number of recovery blocks to read: the peeling decoder reads every
+	// candidate row; the dense path reads one recovery block per lost block.
+	read_count = (par3_ctx->use_peel != 0) ? par3_ctx->peel_avail : lost_count;
+	progress_denom = block_count - lost_count + read_count;	// blocks read in total
+	if (progress_denom <= 0)
+		progress_denom = 1;
 
 	if (par3_ctx->noise_level >= 0){
 		printf("\nRecovering lost input blocks:\n");
@@ -290,7 +298,12 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 			}
 
 			// Recover (multiple & add to) lost input blocks
-			rs_recover_one_all(par3_ctx, block_index, lost_count);
+			if (par3_ctx->use_peel != 0){
+				// Peeling decoder: accumulate into residual rows (nnz ops).
+				rs_peel_input(par3_ctx, block_index);
+			} else {
+				rs_recover_one_all(par3_ctx, block_index, lost_count);
+			}
 
 			// Print progress percent
 			if ( (par3_ctx->noise_level >= 0) && (par3_ctx->noise_level <= 2) ){
@@ -300,7 +313,7 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 					time_old = time_now;
 					// Complexity is "block_count * lost_count * block_size".
 					// Because block_count is 16-bit value, "int" (32-bit signed integer) is enough.
-					progress_now = (progress_step * 1000) / block_count;
+					progress_now = (progress_step * 1000) / progress_denom;
 					if (progress_now != progress_old){
 						progress_old = progress_now;
 						printf("%d.%d%%\r", progress_now / 10, progress_now % 10);	// 0.0% ~ 100.0%
@@ -310,9 +323,13 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 		}
 	}
 
-	// Read using recovery blocks
-	for (lost_index = 0; lost_index < lost_count; lost_index++){
-		block_index = recv_id[lost_index];
+	// Read using recovery blocks (read_count was set above)
+	for (lost_index = 0; lost_index < read_count; lost_index++){
+		if (par3_ctx->use_peel != 0){
+			block_index = par3_ctx->peel_row_ids[lost_index];
+		} else {
+			block_index = recv_id[lost_index];
+		}
 
 		// Search packet for the recovery block
 		for (packet_index = 0; packet_index < packet_count; packet_index++){
@@ -376,7 +393,13 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 		}
 
 		// Recover (multiple & add to) lost input blocks
-		rs_recover_one_all(par3_ctx, lost_id[lost_index], lost_count);
+		if (par3_ctx->use_peel != 0){
+			// Peeling decoder: the recovery block is the constant term of its
+			// own residual row (lost_index is the candidate row index here).
+			rs_peel_recovery(par3_ctx, lost_index);
+		} else {
+			rs_recover_one_all(par3_ctx, lost_id[lost_index], lost_count);
+		}
 
 		// Print progress percent
 		if ( (par3_ctx->noise_level >= 0) && (par3_ctx->noise_level <= 2) ){
@@ -384,7 +407,7 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 			time_now = time(NULL);
 			if (time_now != time_old){
 				time_old = time_now;
-				progress_now = (progress_step * 1000) / block_count;
+				progress_now = (progress_step * 1000) / progress_denom;
 				if (progress_now != progress_old){
 					progress_old = progress_now;
 					printf("%d.%d%%\r", progress_now / 10, progress_now % 10);	// 0.0% ~ 100.0%
@@ -405,6 +428,19 @@ int recover_lost_block(PAR3_CTX *par3_ctx, char *temp_path, int lost_count)
 	}
 	free(work_buf);
 	par3_ctx->work_buf = NULL;
+
+	// Peeling decoder: every residual is complete now; run the peel order
+	// and the core combination to fill the lost block slots.
+	if (par3_ctx->use_peel != 0){
+		ret = rs_peel_solve(par3_ctx, lost_count);
+		rs_peel_free(par3_ctx);	// residual buffers are not needed any more
+		if (ret != 0){
+			printf("Failed to solve the sparse system.\n");
+			if (fp_write != NULL)
+				fclose(fp_write);
+			return ret;
+		}
+	}
 
 	// Restore lost input blocks
 	for (lost_index = 0; lost_index < lost_count; lost_index++){
@@ -891,7 +927,7 @@ int recover_lost_block_split(PAR3_CTX *par3_ctx, char *temp_path, uint64_t lost_
 				if (block_list[block_index].state & 16){
 					// Zero fill partial input block
 					memset(buf_p, 0, region_size);
-				} else if (par3_ctx->ecc_method & 1){	// Cauchy Reed-Solomon Codes
+				} else if (par3_ctx->ecc_method & 3){	// Cauchy or Sparse Reed-Solomon Codes
 					// Zero fill lost input block
 					memset(buf_p, 0, region_size);
 				}
@@ -1047,7 +1083,7 @@ if (par3_ctx->ecc_method & 8){	// FFT based Reed-Solomon Codes
 */
 
 		// Recover lost input blocks
-		if (par3_ctx->ecc_method & 1){	// Cauchy Reed-Solomon Codes
+		if (par3_ctx->ecc_method & 3){	// Cauchy or Sparse Reed-Solomon Codes
 			rs_recover_all(par3_ctx, region_size, (int)lost_count, progress_total, progress_step);
 
 		} else if (par3_ctx->ecc_method & 8){	// FFT based Reed-Solomon Codes

@@ -11,6 +11,7 @@
 #include "galois.h"
 #include "hash.h"
 #include "reedsolomon.h"
+#include "sparse.h"
 
 
 // When it uses Reed-Solomon Erasure Codes, it tries to allocate memory for all recovery blocks.
@@ -66,6 +67,7 @@ int create_recovery_block(PAR3_CTX *par3_ctx)
 	int galois_poly;
 	int block_count, block_index;
 	int progress_old, progress_now;
+	int ret;
 	uint32_t file_index, file_prev;
 	size_t block_size, region_size;
 	size_t data_size, read_size;
@@ -85,9 +87,15 @@ int create_recovery_block(PAR3_CTX *par3_ctx)
 	if ( (par3_ctx->galois_table == NULL) || (par3_ctx->block_data == NULL) )
 		return -1;
 
-	// Only when it uses Reed-Solomon Erasure Codes.
-	if ((par3_ctx->ecc_method & 1) == 0)
+	// Only when it uses Reed-Solomon Erasure Codes (Cauchy or Sparse).
+	if ((par3_ctx->ecc_method & 3) == 0)
 		return -1;
+
+	if (par3_ctx->ecc_method & 2){
+		ret = sparse_matrix_prepare(par3_ctx);
+		if (ret != 0)
+			return ret;
+	}
 
 	block_size = par3_ctx->block_size;
 	block_count = (int)(par3_ctx->block_count);
@@ -616,7 +624,12 @@ int create_recovery_block_split(PAR3_CTX *par3_ctx)
 		}
 
 		// Create all recovery blocks on memory
-		if (par3_ctx->ecc_method & 1){	// Cauchy Reed-Solomon Codes
+		if (par3_ctx->ecc_method & 3){	// Cauchy or Sparse Reed-Solomon Codes
+			if (par3_ctx->ecc_method & 2){
+				ret = sparse_matrix_prepare(par3_ctx);
+				if (ret != 0)
+					return ret;
+			}
 			rs_create_all(par3_ctx, region_size, progress_total, progress_step);
 
 		} else if (par3_ctx->ecc_method & 8){	// FFT based Reed-Solomon Codes

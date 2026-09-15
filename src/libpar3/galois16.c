@@ -33,6 +33,117 @@ plank@cs.utk.edu
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "simd.h"
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define PAR3_X86 1
+#include <immintrin.h>
+#endif
+
+#ifdef PAR3_X86
+#if defined(__GNUC__) || defined(__clang__)
+#define TARGET_SSSE3 __attribute__((target("ssse3")))
+#define TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define TARGET_SSSE3
+#define TARGET_AVX2
+#endif
+
+/*
+ * PSHUFB based GF(2^16) region multiply, "SPLIT(16,4)" technique:
+ * a 16-bit word is 4 nibbles; the product is the XOR of 4 table lookups,
+ * done separately for the low and high product bytes (8 tables of 16).
+ * tbl layout: [pos*16 + k] = low byte, [64 + pos*16 + k] = high byte.
+ *
+ * The word vector is first split into a low-byte plane and a high-byte
+ * plane (pack), looked up, then re-interleaved (unpack). The pack/unpack
+ * pattern keeps the original word order for both SSE and AVX2 lanes.
+ */
+TARGET_SSSE3
+static size_t gf16_region_mul_ssse3(const uint8_t *tbl, const uint16_t *src, uint16_t *dst, size_t nwords, int add)
+{
+	__m128i t0l = _mm_loadu_si128((const __m128i *)(tbl));
+	__m128i t1l = _mm_loadu_si128((const __m128i *)(tbl + 16));
+	__m128i t2l = _mm_loadu_si128((const __m128i *)(tbl + 32));
+	__m128i t3l = _mm_loadu_si128((const __m128i *)(tbl + 48));
+	__m128i t0h = _mm_loadu_si128((const __m128i *)(tbl + 64));
+	__m128i t1h = _mm_loadu_si128((const __m128i *)(tbl + 80));
+	__m128i t2h = _mm_loadu_si128((const __m128i *)(tbl + 96));
+	__m128i t3h = _mm_loadu_si128((const __m128i *)(tbl + 112));
+	__m128i nib = _mm_set1_epi8(0x0F);
+	__m128i lowbyte = _mm_set1_epi16(0x00FF);
+	size_t i;
+
+	for (i = 0; i + 16 <= nwords; i += 16){
+		__m128i va = _mm_loadu_si128((const __m128i *)(src + i));
+		__m128i vb = _mm_loadu_si128((const __m128i *)(src + i + 8));
+		__m128i lo = _mm_packus_epi16(_mm_and_si128(va, lowbyte), _mm_and_si128(vb, lowbyte));
+		__m128i hi = _mm_packus_epi16(_mm_srli_epi16(va, 8), _mm_srli_epi16(vb, 8));
+		__m128i l0 = _mm_and_si128(lo, nib);
+		__m128i l1 = _mm_and_si128(_mm_srli_epi64(lo, 4), nib);
+		__m128i h0 = _mm_and_si128(hi, nib);
+		__m128i h1 = _mm_and_si128(_mm_srli_epi64(hi, 4), nib);
+		__m128i pl = _mm_xor_si128(
+				_mm_xor_si128(_mm_shuffle_epi8(t0l, l0), _mm_shuffle_epi8(t1l, l1)),
+				_mm_xor_si128(_mm_shuffle_epi8(t2l, h0), _mm_shuffle_epi8(t3l, h1)));
+		__m128i ph = _mm_xor_si128(
+				_mm_xor_si128(_mm_shuffle_epi8(t0h, l0), _mm_shuffle_epi8(t1h, l1)),
+				_mm_xor_si128(_mm_shuffle_epi8(t2h, h0), _mm_shuffle_epi8(t3h, h1)));
+		__m128i o0 = _mm_unpacklo_epi8(pl, ph);
+		__m128i o1 = _mm_unpackhi_epi8(pl, ph);
+		if (add){
+			o0 = _mm_xor_si128(o0, _mm_loadu_si128((const __m128i *)(dst + i)));
+			o1 = _mm_xor_si128(o1, _mm_loadu_si128((const __m128i *)(dst + i + 8)));
+		}
+		_mm_storeu_si128((__m128i *)(dst + i), o0);
+		_mm_storeu_si128((__m128i *)(dst + i + 8), o1);
+	}
+	return i;	// number of words processed
+}
+
+TARGET_AVX2
+static size_t gf16_region_mul_avx2(const uint8_t *tbl, const uint16_t *src, uint16_t *dst, size_t nwords, int add)
+{
+	__m256i t0l = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl)));
+	__m256i t1l = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 16)));
+	__m256i t2l = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 32)));
+	__m256i t3l = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 48)));
+	__m256i t0h = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 64)));
+	__m256i t1h = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 80)));
+	__m256i t2h = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 96)));
+	__m256i t3h = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 112)));
+	__m256i nib = _mm256_set1_epi8(0x0F);
+	__m256i lowbyte = _mm256_set1_epi16(0x00FF);
+	size_t i;
+
+	for (i = 0; i + 32 <= nwords; i += 32){
+		__m256i va = _mm256_loadu_si256((const __m256i *)(src + i));
+		__m256i vb = _mm256_loadu_si256((const __m256i *)(src + i + 16));
+		__m256i lo = _mm256_packus_epi16(_mm256_and_si256(va, lowbyte), _mm256_and_si256(vb, lowbyte));
+		__m256i hi = _mm256_packus_epi16(_mm256_srli_epi16(va, 8), _mm256_srli_epi16(vb, 8));
+		__m256i l0 = _mm256_and_si256(lo, nib);
+		__m256i l1 = _mm256_and_si256(_mm256_srli_epi64(lo, 4), nib);
+		__m256i h0 = _mm256_and_si256(hi, nib);
+		__m256i h1 = _mm256_and_si256(_mm256_srli_epi64(hi, 4), nib);
+		__m256i pl = _mm256_xor_si256(
+				_mm256_xor_si256(_mm256_shuffle_epi8(t0l, l0), _mm256_shuffle_epi8(t1l, l1)),
+				_mm256_xor_si256(_mm256_shuffle_epi8(t2l, h0), _mm256_shuffle_epi8(t3l, h1)));
+		__m256i ph = _mm256_xor_si256(
+				_mm256_xor_si256(_mm256_shuffle_epi8(t0h, l0), _mm256_shuffle_epi8(t1h, l1)),
+				_mm256_xor_si256(_mm256_shuffle_epi8(t2h, h0), _mm256_shuffle_epi8(t3h, h1)));
+		__m256i o0 = _mm256_unpacklo_epi8(pl, ph);
+		__m256i o1 = _mm256_unpackhi_epi8(pl, ph);
+		if (add){
+			o0 = _mm256_xor_si256(o0, _mm256_loadu_si256((const __m256i *)(dst + i)));
+			o1 = _mm256_xor_si256(o1, _mm256_loadu_si256((const __m256i *)(dst + i + 16)));
+		}
+		_mm256_storeu_si256((__m256i *)(dst + i), o0);
+		_mm256_storeu_si256((__m256i *)(dst + i + 16), o1);
+	}
+	return i;	// number of words processed
+}
+#endif	// PAR3_X86
+
 
 // Create tables for 16-bit Galois Field
 // Return main pointer of tables.
@@ -162,11 +273,12 @@ void gf16_region_multiply(uint16_t *galois_log_table,
 {
 	uint16_t *ur1, *ur2;
 	int prod, v;
-	size_t i;
+	size_t i, start;
 
 	ur1 = (uint16_t *) region;
 	ur2 = (r2 == NULL) ? ur1 : (uint16_t *) r2;
 	nbytes /= 2;	// Convert unit from byte to count.
+	start = 0;
 
 	if (multby == 0) {
 		if (add == 0){
@@ -194,78 +306,117 @@ void gf16_region_multiply(uint16_t *galois_log_table,
 			}
 		}
 
-	// Use 8-bit split tables, only when nbytes is enough long.
-	} else if (nbytes >= 1000){
-		int j, k, prim_poly;
-		uint16_t htable[256], ltable[256];
-
-		// This table setup requires a bit time.
-		prim_poly = galois_log_table[0] | 0x10000;
-		v = multby;
-		ltable[0] = 0;
-		for (j = 1; j < 256; j <<= 1) {
-			for (k = 0; k < j; k++)
-				ltable[k^j] = (v ^ ltable[k]);
-
-			// v = v * 2
-			v = (v & (1 << 15)) ? ((v << 1) ^ prim_poly) : (v << 1);
-		}
-		htable[0] = 0;
-		for (j = 1; j < 256; j <<= 1) {
-			for (k = 0; k < j; k++)
-				htable[k^j] = (v ^ htable[k]);
-
-			// v = v * 2
-			v = (v & (1 << 15)) ? ((v << 1) ^ prim_poly) : (v << 1);
-		}
-
-		if ( (r2 == NULL) || (add == 0) ) {
-			for (i = 0; i < nbytes; i++) {
-				v = ur1[i];
-				if (v == 0) {
-					ur2[i] = 0;
-				} else {
-				    prod = htable[v >> 8];
-				    prod ^= ltable[v & 0xFF];
-					ur2[i] = prod;
-				}
-			}
-		} else {
-			for (i = 0; i < nbytes; i++) {
-				v = ur1[i];
-				if (v != 0) {
-				    prod = htable[v >> 8];
-				    prod ^= ltable[v & 0xFF];
-					ur2[i] ^= prod;
-				}
-			}
-		}
-
-	// Use Log & iLog tables
 	} else {
-		uint16_t *galois_ilog_table;
+		int add_mode = (add != 0) && (r2 != NULL);
 
-		galois_ilog_table = galois_log_table + 65536;
-		v = galois_log_table[multby];
+#ifdef PAR3_X86
+		// PSHUFB based 4-bit split multiply (SSSE3 / AVX2)
+		if ( (nbytes >= 32) && (par3_simd_level() >= 1) ){
+			int j, k, p, prim_poly;
+			uint16_t nib_product[4][16];
+			uint8_t tbl[128];	// [0..63] low bytes, [64..127] high bytes; 16 per nibble position
 
-		if ( (r2 == NULL) || (add == 0) ) {
-			for (i = 0; i < nbytes; i++) {
-				if (ur1[i] == 0) {
-					ur2[i] = 0;
-				} else {
-					prod = galois_log_table[ur1[i]] + v;
-					if (prod >= 65535)
-						prod -= 65535;
-					ur2[i] = galois_ilog_table[prod];
+			// Build products of multby with every nibble value at every
+			// position by successive doubling (16 doublings in total).
+			prim_poly = galois_log_table[0] | 0x10000;
+			v = multby;
+			for (p = 0; p < 4; p++){
+				nib_product[p][0] = 0;
+				for (j = 1; j < 16; j <<= 1) {
+					for (k = 0; k < j; k++)
+						nib_product[p][k ^ j] = (uint16_t)(v ^ nib_product[p][k]);
+					// v = v * 2
+					v = (v & (1 << 15)) ? ((v << 1) ^ prim_poly) : (v << 1);
 				}
 			}
+			for (p = 0; p < 4; p++){
+				for (k = 0; k < 16; k++){
+					tbl[p * 16 + k]      = (uint8_t)(nib_product[p][k] & 0xFF);
+					tbl[64 + p * 16 + k] = (uint8_t)(nib_product[p][k] >> 8);
+				}
+			}
+
+			if (par3_simd_level() >= 2){
+				start = gf16_region_mul_avx2(tbl, ur1, ur2, nbytes, add_mode);
+			} else {
+				start = gf16_region_mul_ssse3(tbl, ur1, ur2, nbytes, add_mode);
+			}
+		}
+#endif
+
+		// Use 8-bit split tables, only when the remainder is long enough.
+		if (nbytes - start >= 1000){
+			int j, k, prim_poly;
+			uint16_t htable[256], ltable[256];
+
+			// This table setup requires a bit time.
+			prim_poly = galois_log_table[0] | 0x10000;
+			v = multby;
+			ltable[0] = 0;
+			for (j = 1; j < 256; j <<= 1) {
+				for (k = 0; k < j; k++)
+					ltable[k^j] = (v ^ ltable[k]);
+
+				// v = v * 2
+				v = (v & (1 << 15)) ? ((v << 1) ^ prim_poly) : (v << 1);
+			}
+			htable[0] = 0;
+			for (j = 1; j < 256; j <<= 1) {
+				for (k = 0; k < j; k++)
+					htable[k^j] = (v ^ htable[k]);
+
+				// v = v * 2
+				v = (v & (1 << 15)) ? ((v << 1) ^ prim_poly) : (v << 1);
+			}
+
+			if (add_mode == 0) {
+				for (i = start; i < nbytes; i++) {
+					v = ur1[i];
+					if (v == 0) {
+						ur2[i] = 0;
+					} else {
+					    prod = htable[v >> 8];
+					    prod ^= ltable[v & 0xFF];
+						ur2[i] = prod;
+					}
+				}
+			} else {
+				for (i = start; i < nbytes; i++) {
+					v = ur1[i];
+					if (v != 0) {
+					    prod = htable[v >> 8];
+					    prod ^= ltable[v & 0xFF];
+						ur2[i] ^= prod;
+					}
+				}
+			}
+
+		// Use Log & iLog tables
 		} else {
-			for (i = 0; i < nbytes; i++) {
-				if (ur1[i] != 0) {
-					prod = galois_log_table[ur1[i]] + v;
-					if (prod >= 65535)
-						prod -= 65535;
-					ur2[i] ^= galois_ilog_table[prod];
+			uint16_t *galois_ilog_table;
+
+			galois_ilog_table = galois_log_table + 65536;
+			v = galois_log_table[multby];
+
+			if (add_mode == 0) {
+				for (i = start; i < nbytes; i++) {
+					if (ur1[i] == 0) {
+						ur2[i] = 0;
+					} else {
+						prod = galois_log_table[ur1[i]] + v;
+						if (prod >= 65535)
+							prod -= 65535;
+						ur2[i] = galois_ilog_table[prod];
+					}
+				}
+			} else {
+				for (i = start; i < nbytes; i++) {
+					if (ur1[i] != 0) {
+						prod = galois_log_table[ur1[i]] + v;
+						if (prod >= 65535)
+							prod -= 65535;
+						ur2[i] ^= galois_ilog_table[prod];
+					}
 				}
 			}
 		}

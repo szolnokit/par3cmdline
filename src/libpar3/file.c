@@ -6,6 +6,11 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include "packet.h"
 
 
@@ -121,25 +126,54 @@ int make_fat_permission_packet(PAR3_CTX *par3_ctx, char *file_name, uint8_t *che
 	size_t packet_size;
 	uint64_t file_time;
 	struct _stat64 stat_buf;
+#ifdef _WIN32
+	HANDLE hFile;
+	FILETIME ftCreate, ftAccess, ftWrite;
+	DWORD attrs;
+	wchar_t wpath[_MAX_PATH];
+#endif
 
 	// Store infomation, only when scuucess.
 	if (_stat64(file_name, &stat_buf) != 0)
 		return 1;
 
-/*
-	printf("Status information of \"%s\"\n", file_name);
-	printf("st_mtime = %s", _ctime64(&(stat_buf.st_mtime)));
-*/
-
 	// It makes a packet on stack memory temporary.
 	packet_size = 48;
-	memset(pkt_buf + packet_size, 0xFF, 16);	// CreationTimestamp and LastAccessTimestamp are not set.
+	memset(pkt_buf + packet_size, 0xFF, 16);	// CreationTimestamp and LastAccessTimestamp default unset
 	packet_size += 16;
 	file_time = TimetToFileTime(stat_buf.st_mtime);	// Convert UNIX time to Windows FILETIME.
 	memcpy(pkt_buf + packet_size, &file_time, 8);	// LastWriteTimestamp
 	packet_size += 8;
-	memset(pkt_buf + packet_size, 0xFF, 2);	// FileAttributes isn't set.
+	memset(pkt_buf + packet_size, 0xFF, 2);	// FileAttributes default unset
 	packet_size += 2;
+
+#ifdef _WIN32
+	/* Prefer Win32 APIs for full FAT metadata when available. */
+	if (MultiByteToWideChar(CP_UTF8, 0, file_name, -1, wpath, _MAX_PATH) > 0){
+		hFile = CreateFileW(wpath, GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				NULL, OPEN_EXISTING,
+				FILE_FLAG_BACKUP_SEMANTICS, NULL);
+		if (hFile != INVALID_HANDLE_VALUE){
+			if (GetFileTime(hFile, &ftCreate, &ftAccess, &ftWrite)){
+				uint64_t t;
+				memcpy(&t, &ftCreate, 8);
+				memcpy(pkt_buf + 48, &t, 8);			// CreationTimestamp
+				memcpy(&t, &ftAccess, 8);
+				memcpy(pkt_buf + 48 + 8, &t, 8);		// LastAccessTimestamp
+				memcpy(&t, &ftWrite, 8);
+				memcpy(pkt_buf + 48 + 16, &t, 8);		// LastWriteTimestamp
+			}
+			CloseHandle(hFile);
+		}
+		attrs = GetFileAttributesW(wpath);
+		if (attrs != INVALID_FILE_ATTRIBUTES){
+			uint16_t a = (uint16_t)(attrs & 0xFFFF);
+			memcpy(pkt_buf + 48 + 24, &a, 2);			// FileAttributes
+		}
+	}
+#endif
+
 	// Packet size = 48 + 26 = 74
 	make_packet_header(pkt_buf, packet_size, par3_ctx->set_id, "PAR FAT\0", 1);
 
@@ -474,27 +508,70 @@ static int reset_file_system_info(PAR3_CTX *par3_ctx, uint8_t *checksum, char *f
 				}
 
 			} else if (memcmp(packet_type, "PAR FAT\0", 8) == 0){	// FAT Permissions Packet
-				// Recover infomation, only when scuucess.
-				if (_stat64(file_name, &stat_buf) == 0){
-					//printf("mtime = %s", _ctime64(&(stat_buf.st_mtime)));
+				// Recover information when possible.
+#ifdef _WIN32
+				{
+					HANDLE hFile;
+					FILETIME ftCreate, ftAccess, ftWrite;
+					uint64_t tCreate, tAccess, tWrite;
+					uint16_t stored_attrs;
+					wchar_t wpath[_MAX_PATH];
 
-					if (par3_ctx->file_system & 0x10000){	// LastWriteTimestamp
-						memcpy(&item_value8, buf + offset + 48 + 16, 8);
-						if (item_value8 != 0xFFFFFFFFFFFFFFFF){
-							item_value8 = FileTimeToTimet(item_value8);
-							//printf("LastWriteTime = %s", _ctime64(&item_value8));
-							if (item_value8 != stat_buf.st_mtime){	// Timestamp is different.
-								struct _utimbuf ut;
+					memcpy(&tCreate, buf + offset + 48, 8);
+					memcpy(&tAccess, buf + offset + 48 + 8, 8);
+					memcpy(&tWrite, buf + offset + 48 + 16, 8);
+					memcpy(&stored_attrs, buf + offset + 48 + 24, 2);
 
-								ut.actime = stat_buf.st_atime;	// Reuse current atime
-								ut.modtime = item_value8;		// Recover to stored mtime
-								if (_utime(file_name, &ut) != 0)
-									ret |= 0x10000;	// Failed to reset timestamp
-								// Caution ! UNIX time is low resolution than Windows FILETIME.
+					if (MultiByteToWideChar(CP_UTF8, 0, file_name, -1, wpath, _MAX_PATH) > 0){
+						if (par3_ctx->file_system & 0x10000){
+							hFile = CreateFileW(wpath, FILE_WRITE_ATTRIBUTES,
+									FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+									NULL, OPEN_EXISTING,
+									FILE_FLAG_BACKUP_SEMANTICS, NULL);
+							if (hFile != INVALID_HANDLE_VALUE){
+								FILETIME *pC = NULL, *pA = NULL, *pW = NULL;
+								if (tCreate != 0xFFFFFFFFFFFFFFFFULL){
+									memcpy(&ftCreate, &tCreate, 8);
+									pC = &ftCreate;
+								}
+								if (tAccess != 0xFFFFFFFFFFFFFFFFULL){
+									memcpy(&ftAccess, &tAccess, 8);
+									pA = &ftAccess;
+								}
+								if (tWrite != 0xFFFFFFFFFFFFFFFFULL){
+									memcpy(&ftWrite, &tWrite, 8);
+									pW = &ftWrite;
+								}
+								if ( (pC || pA || pW) && !SetFileTime(hFile, pC, pA, pW) )
+									ret |= 0x10000;
+								CloseHandle(hFile);
+							} else {
+								ret |= 0x10000;
+							}
+							if (stored_attrs != 0xFFFF){
+								if (!SetFileAttributesW(wpath, (DWORD)stored_attrs))
+									ret |= 0x10000;
 							}
 						}
 					}
 				}
+#else
+				if (_stat64(file_name, &stat_buf) == 0){
+					if (par3_ctx->file_system & 0x10000){	// LastWriteTimestamp
+						memcpy(&item_value8, buf + offset + 48 + 16, 8);
+						if (item_value8 != 0xFFFFFFFFFFFFFFFF){
+							item_value8 = FileTimeToTimet(item_value8);
+							if (item_value8 != stat_buf.st_mtime){
+								struct _utimbuf ut;
+								ut.actime = stat_buf.st_atime;
+								ut.modtime = item_value8;
+								if (_utime(file_name, &ut) != 0)
+									ret |= 0x10000;
+							}
+						}
+					}
+				}
+#endif
 			}
 		}
 

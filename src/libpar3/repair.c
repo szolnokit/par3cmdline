@@ -2,6 +2,7 @@
 
 #include "common.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,18 @@
 #include "file.h"
 #include "inside.h"
 #include "verify.h"
+
+
+// Create a new empty file; fail if it already exists (avoids clobbering user data).
+static FILE *fopen_create_exclusive(const char *path)
+{
+	FILE *fp = fopen(path, "wbx");
+	if (fp == NULL && errno == EEXIST){
+		printf("Temporary file already exists: \"%s\"\n", path);
+		printf("Remove it or choose another working directory, then retry.\n");
+	}
+	return fp;
+}
 
 
 // It will restore permissions or attributes after files are repaired.
@@ -99,8 +112,7 @@ int create_temp_file(PAR3_CTX *par3_ctx, char *temp_path)
 		// The input file is missing or damaged.
 		if ( ((file_list[file_index].state & 3) != 0) && ((file_list[file_index].state & 4) == 0) ){
 			sprintf(temp_path + 22, "%u.tmp", file_index);
-			//fp = fopen(temp_path, "wbx");	// Error at over writing temporary file
-			fp = fopen(temp_path, "wb");	// There is a risk of over writing existing file of same name.
+			fp = fopen_create_exclusive(temp_path);
 			if (fp == NULL){
 				perror("Failed to create temporary file");
 				return RET_FILE_IO_ERROR;
@@ -349,7 +361,8 @@ int try_restore_input_file(PAR3_CTX *par3_ctx, char *temp_path)
 		if ( ((file_list[file_index].state & 3) != 0) && ((file_list[file_index].state & 4) == 0)
 				&& ((file_list[file_index].state & 0x200) != 0) ){	// Checked repairable already
 			sprintf(temp_path + 22, "%u.tmp", file_index);
-			fp_write = fopen(temp_path, "wb");	// There is a risk of over writing existing file of same name.
+			// File was created empty by create_temp_file(); open without truncating other names.
+			fp_write = fopen(temp_path, "r+b");
 			if (fp_write == NULL){
 				perror("Failed to open temporary file");
 				return RET_FILE_IO_ERROR;

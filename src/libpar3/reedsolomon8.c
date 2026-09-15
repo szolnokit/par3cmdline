@@ -6,21 +6,175 @@
 #include <string.h>
 
 #include "galois.h"
+#include "sparse.h"
 
 
-// Gaussian elimination of matrix for Cauchy Reed-Solomon
+// Gaussian elimination for Sparse Random Matrix.
+// Uses every available recovery block as a candidate row, so repair succeeds
+// whenever any invertible subset exists (not only the first lost_count blocks).
+static int rs8_gaussian_sparse(PAR3_CTX *par3_ctx, int lost_count)
+{
+	uint8_t *gf_table, *matrix;
+	int x, y, y2, r;
+	int *lost_id, *recv_id, *all_ids;
+	size_t block_count;	// size_t: index math must not overflow with extended block count
+	int avail;
+	int pivot, factor, factor2;
+
+	block_count = (size_t)(par3_ctx->block_count);
+	gf_table = par3_ctx->galois_table;
+	recv_id = par3_ctx->recv_id_list;
+	lost_id = recv_id + lost_count;
+
+	// Gather available recovery blocks for this Matrix Packet.
+	// Spare rows beyond lost_count let elimination sidestep singular subsets.
+	// The margin must scale with the matrix density: a lost column is touched
+	// by a candidate row with probability nnz / max_recovery, so we need about
+	// (8 * max_recovery / nnz) rows for every column to be covered well.
+	{
+		uint64_t margin = 64;
+		if (par3_ctx->sparse_nnz > 0){
+			uint64_t need = (8 * par3_ctx->sparse_max_recovery) / par3_ctx->sparse_nnz;
+			if (need > margin)
+				margin = need;
+		}
+		avail = (int)(par3_ctx->sparse_max_recovery);
+		if ((uint64_t)avail > (uint64_t)lost_count + margin)
+			avail = lost_count + (int)margin;
+	}
+	all_ids = malloc(sizeof(int) * avail);
+	if (all_ids == NULL){
+		printf("Failed to allocate memory for recovery id list\n");
+		return RET_MEMORY_ERROR;
+	}
+	avail = sparse_gather_recovery_ids(par3_ctx, all_ids, avail);
+	if (avail < lost_count){
+		printf("Not enough recovery blocks for sparse repair (%d of %d).\n", avail, lost_count);
+		free(all_ids);
+		return RET_LOGIC_ERROR;
+	}
+
+	// Lost blocks outside the covered range cannot be repaired by this set.
+	{
+		uint64_t range_first = par3_ctx->matrix_first_block;
+		uint64_t range_last = par3_ctx->matrix_last_block;
+		if (range_last == 0)
+			range_last = par3_ctx->block_count;
+		for (y = 0; y < lost_count; y++){
+			if ( ((uint64_t)lost_id[y] < range_first) || ((uint64_t)lost_id[y] >= range_last) ){
+				printf("Lost block[%d] is outside the range covered by this PAR3 set (%"PRIu64" - %"PRIu64").\n",
+						lost_id[y], range_first, range_last - 1);
+				printf("Repair that block with the parent backup's PAR3 files.\n");
+				free(all_ids);
+				return RET_LOGIC_ERROR;
+			}
+		}
+	}
+
+	// Allocate matrix with a row per candidate recovery block.
+	matrix = malloc((size_t)block_count * avail);
+	if (matrix == NULL){
+		printf("Failed to allocate memory for matrix\n");
+		free(all_ids);
+		return RET_MEMORY_ERROR;
+	}
+	par3_ctx->matrix = matrix;
+
+	for (y = 0; y < avail; y++){
+		for (x = 0; x < block_count; x++){
+			matrix[block_count * y + x] = (uint8_t)sparse_matrix_element(par3_ctx, x, all_ids[y]);
+		}
+	}
+
+	// Gauss-Jordan elimination with row pivoting over all candidate rows.
+	for (y = 0; y < lost_count; y++){
+		pivot = lost_id[y];
+
+		// Find a row with non-zero value in the pivot column.
+		r = -1;
+		for (y2 = y; y2 < avail; y2++){
+			if (matrix[block_count * y2 + pivot] != 0){
+				r = y2;
+				break;
+			}
+		}
+		if (r < 0){
+			printf("Failed to invert sparse matrix at lost block[%d].\n", pivot);
+			printf("More recovery blocks are required for this damage pattern.\n");
+			free(all_ids);
+			return RET_LOGIC_ERROR;
+		}
+		if (r != y){	// Swap rows and their recovery ids.
+			int tmp_id = all_ids[y];
+			all_ids[y] = all_ids[r];
+			all_ids[r] = tmp_id;
+			for (x = 0; x < block_count; x++){
+				uint8_t tmp = matrix[block_count * y + x];
+				matrix[block_count * y + x] = matrix[block_count * r + x];
+				matrix[block_count * r + x] = tmp;
+			}
+		}
+
+		// Let pivot value be 1.
+		factor = gf8_reciprocal(gf_table, matrix[block_count * y + pivot]);
+		gf8_region_multiply(gf_table, matrix + block_count * y, factor, block_count, NULL, 0);
+
+		// Erase values of same pivot on all other rows (selected and candidate).
+		// Rows are independent of each other: parallelize.
+#ifdef _OPENMP
+#pragma omp parallel for private(factor2) if(block_count >= 256)
+#endif
+		for (y2 = 0; y2 < avail; y2++){
+			if (y2 == y)
+				continue;
+
+			factor2 = matrix[block_count * y2 + pivot];
+			gf8_region_multiply(gf_table, matrix + block_count * y, factor2, block_count, matrix + block_count * y2, 1);
+
+			// After eliminating the pivot value, store "factor * factor2" on the pivot.
+			matrix[block_count * y2 + pivot] = gf8_multiply(gf_table, factor, factor2);
+		}
+
+		// After eliminating the pivot column, store "factor" on the pivot.
+		matrix[block_count * y + pivot] = factor;
+	}
+
+	// Publish which recovery blocks were selected.
+	for (y = 0; y < lost_count; y++)
+		recv_id[y] = all_ids[y];
+	free(all_ids);
+
+	if (par3_ctx->noise_level >= 3){
+		printf("\n recovery matrix (%d * %d):\n", block_count, lost_count);
+		for (y = 0; y < lost_count; y++){
+			printf("recv%3d -> lost%3d =", recv_id[y], lost_id[y]);
+			for (x = 0; x < block_count; x++){
+				printf(" %2x", matrix[block_count * y + x]);
+			}
+			printf("\n");
+		}
+	}
+
+	return 0;
+}
+
+// Gaussian elimination of matrix for Cauchy / Sparse Reed-Solomon
 int rs8_gaussian_elimination(PAR3_CTX *par3_ctx, int lost_count)
 {
 	uint8_t *gf_table, *matrix;
 	int x, y, y_R, y2;
 	int *lost_id, *recv_id;
-	int block_count;
+	size_t block_count;	// size_t: index math must not overflow with extended block count
 	int pivot, factor, factor2;
+	int range_first, range_last;
 
 	if (lost_count == 0)
 		return 0;
 
-	block_count = (int)(par3_ctx->block_count);
+	if (par3_ctx->ecc_method & 2)	// Sparse Random Matrix
+		return rs8_gaussian_sparse(par3_ctx, lost_count);
+
+	block_count = (size_t)(par3_ctx->block_count);
 	gf_table = par3_ctx->galois_table;
 	recv_id = par3_ctx->recv_id_list;
 	lost_id = recv_id + lost_count;
@@ -33,13 +187,36 @@ int rs8_gaussian_elimination(PAR3_CTX *par3_ctx, int lost_count)
 	}
 	par3_ctx->matrix = matrix;
 
+	// Range of input blocks covered by the Matrix Packet (incremental backup).
+	// Blocks outside the range have zero matrix elements.
+	range_first = 0;
+	range_last = block_count;
+	if (par3_ctx->matrix_last_block != 0){
+		range_first = (int)(par3_ctx->matrix_first_block);
+		range_last = (int)(par3_ctx->matrix_last_block);
+		if (range_last > block_count)
+			range_last = block_count;
+	}
+	for (y = 0; y < lost_count; y++){
+		if ( (lost_id[y] < range_first) || (lost_id[y] >= range_last) ){
+			printf("Lost block[%d] is outside the range covered by this PAR3 set (%d - %d).\n",
+					lost_id[y], range_first, range_last - 1);
+			printf("Repair that block with the parent backup's PAR3 files.\n");
+			return RET_LOGIC_ERROR;
+		}
+	}
+
 	// Set matrix elements
 	for (y = 0; y < lost_count; y++){	// per each recovery block
 		// These are elements of generator matrix.
 		y_R = 255 - recv_id[y];	// y_R = MAX - y_index
 		for (x = 0; x < block_count; x++){
-			// inv( x_index ^ y_R )
-			matrix[block_count * y + x] = gf8_reciprocal(gf_table, x ^ y_R);
+			if ( (x < range_first) || (x >= range_last) ){
+				matrix[block_count * y + x] = 0;	// outside the covered range
+			} else {
+				// inv( x_index ^ y_R )
+				matrix[block_count * y + x] = gf8_reciprocal(gf_table, x ^ y_R);
+			}
 		}
 
 		// No need to set values for recovery blocks,
@@ -70,6 +247,10 @@ int rs8_gaussian_elimination(PAR3_CTX *par3_ctx, int lost_count)
 		gf8_region_multiply(gf_table, matrix + block_count * y, factor, block_count, NULL, 0);
 
 		// Erase values of same pivot on other rows.
+		// Rows are independent of each other: parallelize.
+#ifdef _OPENMP
+#pragma omp parallel for private(factor2) if(block_count >= 256)
+#endif
 		for (y2 = 0; y2 < lost_count; y2++){
 			if (y2 == y)
 				continue;
@@ -120,12 +301,12 @@ int rs8_invert_matrix_cauchy(PAR3_CTX *par3_ctx, int lost_count)
 	int *x, *y, *a, *b, *c, *d;
 	int i, j, k;
 	int *lost_id, *recv_id;
-	int block_count;
+	size_t block_count;	// size_t: index math must not overflow
 
 	if (lost_count == 0)
 		return 0;
 
-	block_count = (int)(par3_ctx->block_count);
+	block_count = (size_t)(par3_ctx->block_count);
 	gf_table = par3_ctx->galois_table;
 	recv_id = par3_ctx->recv_id_list;
 	lost_id = recv_id + lost_count;

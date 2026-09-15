@@ -77,9 +77,14 @@ static void print_help(void)
 "  -D       : Store Data packets\n"
 "  -d<n>    : Enable deduplication of input blocks\n"
 "  -e<n>    : Set using Error Correction Codes\n"
+"  -e1      : Cauchy Reed-Solomon Codes (default)\n"
+"  -e2      : Sparse Random Matrix Codes\n"
+"  -e2x     : Sparse Random Matrix Codes with extended block count (> 65536)\n"
+"  -e8      : FFT based Reed-Solomon Codes\n"
 "  -i<n>    : Number of interleaving\n"
 "  -fu<n>   : Use UNIX Permissions Packet\n"
 "  -ff      : Use FAT Permissions Packet\n"
+"  -P<path> : Parent PAR3 file for incremental backup\n"
 "  -lp<n>   : Limit repetition of packets in each file\n"
 "  -C<text> : Set comment\n"
 	);
@@ -560,7 +565,18 @@ int main(int argc, char *argv[])
 					ret = RET_INVALID_COMMAND;
 					goto prepare_return;
 				} else {
-					par3_ctx->ecc_method = strtoul(tmp_p + 1, NULL, 10);
+					char *end_p;
+					par3_ctx->ecc_method = strtoul(tmp_p + 1, &end_p, 10);
+					if ( (end_p[0] == 'x') || (end_p[0] == 'X') ){
+						// Extended block count (more than 65536 input blocks)
+						if (par3_ctx->ecc_method == 2){
+							par3_ctx->ecc_extended = 1;
+						} else {
+							printf("Extended block count (x) is possible with Sparse Random Matrix (-e2x) only.\n");
+							ret = RET_INVALID_COMMAND;
+							goto prepare_return;
+						}
+					}
 					if (popcount32(par3_ctx->ecc_method) > 1){
 						printf("Cannot specify multiple Error Correction Codes.\n");
 						par3_ctx->ecc_method = 0;
@@ -621,6 +637,26 @@ int main(int argc, char *argv[])
 							ret = RET_MEMORY_ERROR;
 							goto prepare_return;
 						}
+					}
+				}
+
+			} else if ( (tmp_p[0] == 'P') && (tmp_p[1] != 0) ){	// Parent PAR3 for incremental backup
+				if (command_operation != 'c'){
+					printf("Cannot specify parent PAR3 unless creating.\n");
+					ret = RET_INVALID_COMMAND;
+					goto prepare_return;
+				} else if (par3_ctx->parent_filename[0] != 0){
+					printf("Cannot specify parent PAR3 twice.\n");
+					ret = RET_INVALID_COMMAND;
+					goto prepare_return;
+				} else {
+					path_copy(par3_ctx->parent_filename, tmp_p + 1, _MAX_PATH - 8);
+					ret = load_parent_backup(par3_ctx, par3_ctx->parent_filename);
+					if (ret != 0)
+						goto prepare_return;
+					if (add_creator_text(par3_ctx, tmp_p - 1) != 0){
+						ret = RET_MEMORY_ERROR;
+						goto prepare_return;
 					}
 				}
 

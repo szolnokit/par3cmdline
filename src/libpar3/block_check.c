@@ -267,6 +267,10 @@ uint64_t aggregate_input_block(PAR3_CTX *par3_ctx)
 			// When a block has a full slice, the whole block data is available.
 			block_available++;
 
+		} else if (block_list[block_index].state & 32){
+			// Unused block of an incremental backup chain: no repair needed.
+			block_available++;
+
 		} else if (block_list[block_index].state & 8){
 			// When a block has a tail slice, I need to check which data is available.
 			skip_count = old_count = 0;
@@ -337,7 +341,7 @@ uint64_t aggregate_recovery_block(PAR3_CTX *par3_ctx)
 		// At this time, this supports only one Error Correction Codes at a time.
 
 		if (memcmp(packet_type, "PAR CAU\0", 8) == 0){	// Cauchy Matrix Packet
-			uint64_t hint_num;
+			uint64_t hint_num, first_num, last_num;
 
 			// Search Recovery Data packet for this Matrix Packet
 			find_count = 0;
@@ -346,6 +350,9 @@ uint64_t aggregate_recovery_block(PAR3_CTX *par3_ctx)
 					find_count++;
 				}
 			}
+			// range of covered input blocks (0/0 = every input block)
+			memcpy(&first_num, buf + offset + 48, 8);
+			memcpy(&last_num, buf + offset + 56, 8);
 			// hint for number of recovery blocks
 			memcpy(&hint_num, buf + offset + 64, 8);
 			if (par3_ctx->noise_level >= 0){
@@ -361,6 +368,51 @@ uint64_t aggregate_recovery_block(PAR3_CTX *par3_ctx)
 				par3_ctx->ecc_method = 1;	// At this time, exclusive to others.
 				par3_ctx->max_recovery_block = hint_num;
 				par3_ctx->matrix_packet_offset = offset;
+				par3_ctx->matrix_first_block = first_num;
+				par3_ctx->matrix_last_block = last_num;
+			}
+
+		// Sparse Random Matrix Packet (SPX = extended block count variant)
+		} else if ( (memcmp(packet_type, "PAR SPA\0", 8) == 0)
+					|| (memcmp(packet_type, "PAR SPX\0", 8) == 0) ){
+			uint64_t max_num, nnz, seed, first_num, last_num;
+
+			if (packet_size < 88){	// 48 header + 40 body
+				printf("Sparse Random Matrix Packet is too small (%"PRIu64" bytes), ignored.\n", packet_size);
+				offset += packet_size;
+				continue;
+			}
+			find_count = 0;
+			for (item_index = 0; item_index < packet_count; item_index++){
+				if (memcmp(packet_list[item_index].matrix, packet_checksum, 16) == 0){
+					find_count++;
+				}
+			}
+			memcpy(&first_num, buf + offset + 48, 8);
+			memcpy(&last_num, buf + offset + 56, 8);
+			memcpy(&max_num, buf + offset + 64, 8);
+			memcpy(&nnz, buf + offset + 72, 8);
+			memcpy(&seed, buf + offset + 80, 8);
+			if (par3_ctx->noise_level >= 0){
+				printf("You have %"PRIu64" recovery blocks available for Sparse Random Matrix Codes.\n", find_count);
+			}
+			if (par3_ctx->noise_level >= 1){
+				printf("Max recovery block count = %"PRIu64"\n", max_num);
+				printf("Non-zeros per input block = %"PRIu64"\n", nnz);
+				printf("RNG seed = 0x%"PRIx64"\n", seed);
+			}
+			if (find_count > find_count_max){
+				find_count_max = find_count;
+				par3_ctx->ecc_method = 2;
+				if (memcmp(packet_type, "PAR SPX\0", 8) == 0)
+					par3_ctx->ecc_extended = 1;
+				par3_ctx->max_recovery_block = max_num;
+				par3_ctx->sparse_max_recovery = max_num;
+				par3_ctx->sparse_nnz = nnz;
+				par3_ctx->sparse_seed = seed;
+				par3_ctx->matrix_packet_offset = offset;
+				par3_ctx->matrix_first_block = first_num;
+				par3_ctx->matrix_last_block = last_num;
 			}
 
 		} else if (memcmp(packet_type, "PAR FFT\0", 8) == 0){	// FFT Matrix Packet
@@ -377,34 +429,35 @@ uint64_t aggregate_recovery_block(PAR3_CTX *par3_ctx)
 			}
 			// max number of recovery blocks
 			shift_num = buf[offset + 64];	// convert to signed integer
-			if ( (shift_num >= 0) && (shift_num <= 15) ){
-				max_num = (uint64_t)1 << shift_num;
+			if ( (shift_num < 0) || (shift_num > 15) ){
+				printf("FFT Matrix Packet: High Rate / unsupported shift value (%d).\n", shift_num);
+				printf("This version supports only Low Rate FFT (shift 0..15).\n");
 			} else {
-				max_num = 32768;
-			}
-			// number of interleaving blocks
-			extra_num = 0;
-			if ((packet_size > 65) && (packet_size <= 69)){	// Read 1 ~ 4 bytes of the last field
-				memcpy(&extra_num, buf + offset + 65, packet_size - 65);
-				max_num *= extra_num + 1;	// When interleaving, max count is multiplied by number of cohorts.
-			}
-			if (par3_ctx->noise_level >= 0){
-				printf("You have %"PRIu64" recovery blocks available for FFT based Reed-Solomon Codes.\n", find_count);
-			}
-			if (par3_ctx->noise_level >= 1){
-				printf("Max recovery block count = %"PRIu64"\n", max_num);
-				if (extra_num > 0){
-					printf("Number of cohort = %u (Interleaving = %u)\n", extra_num + 1, extra_num);
-					printf("Input block count per cohort = %"PRIu64"\n", (par3_ctx->block_count + extra_num) / (extra_num + 1));
-					printf("Max recovery block count per cohort = %"PRIu64"\n", max_num / (extra_num + 1));
+				max_num = (uint64_t)1 << shift_num;
+				// number of interleaving blocks
+				extra_num = 0;
+				if ((packet_size > 65) && (packet_size <= 69)){	// Read 1 ~ 4 bytes of the last field
+					memcpy(&extra_num, buf + offset + 65, packet_size - 65);
+					max_num *= extra_num + 1;	// When interleaving, max count is multiplied by number of cohorts.
 				}
-			}
-			if (find_count > find_count_max){
-				find_count_max = find_count;
-				par3_ctx->ecc_method = 8;
-				par3_ctx->interleave = extra_num;
-				par3_ctx->max_recovery_block = max_num;
-				par3_ctx->matrix_packet_offset = offset;
+				if (par3_ctx->noise_level >= 0){
+					printf("You have %"PRIu64" recovery blocks available for FFT based Reed-Solomon Codes.\n", find_count);
+				}
+				if (par3_ctx->noise_level >= 1){
+					printf("Max recovery block count = %"PRIu64"\n", max_num);
+					if (extra_num > 0){
+						printf("Number of cohort = %u (Interleaving = %u)\n", extra_num + 1, extra_num);
+						printf("Input block count per cohort = %"PRIu64"\n", (par3_ctx->block_count + extra_num) / (extra_num + 1));
+						printf("Max recovery block count per cohort = %"PRIu64"\n", max_num / (extra_num + 1));
+					}
+				}
+				if (find_count > find_count_max){
+					find_count_max = find_count;
+					par3_ctx->ecc_method = 8;
+					par3_ctx->interleave = extra_num;
+					par3_ctx->max_recovery_block = max_num;
+					par3_ctx->matrix_packet_offset = offset;
+				}
 			}
 
 		}
@@ -495,7 +548,7 @@ int make_block_list(PAR3_CTX *par3_ctx, uint64_t lost_count, uint32_t lost_count
 	PAR3_BLOCK_CTX *block_list;
 	PAR3_PKT_CTX *packet_list;
 
-	if (par3_ctx->ecc_method & 1){	// Cauchy Reed-Solomon Codes
+	if (par3_ctx->ecc_method & 3){	// Cauchy or Sparse Reed-Solomon Codes
 		// Make list of index (lost input blocks and using recovery blocks)
 		count = lost_count * 2;
 	} else if (par3_ctx->ecc_method & 8){	// FFT based Reed-Solomon Codes
@@ -542,7 +595,7 @@ int make_block_list(PAR3_CTX *par3_ctx, uint64_t lost_count, uint32_t lost_count
 		}
 	}
 
-	if (par3_ctx->ecc_method & 1){	// Cauchy Reed-Solomon Codes
+	if (par3_ctx->ecc_method & 3){	// Cauchy or Sparse Reed-Solomon Codes
 		int *lost_id = recv_id + lost_count;
 
 		// Set index of lost input blocks
@@ -550,7 +603,7 @@ int make_block_list(PAR3_CTX *par3_ctx, uint64_t lost_count, uint32_t lost_count
 		count = par3_ctx->block_count;
 		id = 0;
 		for (index = 0; index < count; index++){
-			if ((block_list[index].state & (4 | 16)) == 0){
+			if ((block_list[index].state & (4 | 16 | 32)) == 0){	// 32 = unused block (incremental)
 				if (id >= lost_count){
 					printf("Number of lost input block is wrong.\n");
 					return RET_LOGIC_ERROR;
@@ -607,7 +660,7 @@ uint64_t aggregate_block_cohort(PAR3_CTX *par3_ctx, uint32_t *lost_count_cohort,
 	block_list = par3_ctx->block_list;
 	count = par3_ctx->block_count;
 	for (index = 0; index < count; index++){
-		if ((block_list[index].state & (4 | 16)) == 0){
+		if ((block_list[index].state & (4 | 16 | 32)) == 0){	// 32 = unused block (incremental)
 			id = index % cohort_count;
 			lost_list[id] += 1;
 			//printf("lost block[%"PRIu64"] : lost_list[%"PRIu64"] = %u\n", index, id, lost_list[id]);

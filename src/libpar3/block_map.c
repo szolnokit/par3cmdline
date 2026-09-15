@@ -289,10 +289,23 @@ int set_slice_info(PAR3_CTX *par3_ctx)
 	}
 
 	// Check every block has own slice.
-	for (block_index = 0; block_index < block_count; block_index++){
-		if (block_list[block_index].slice == -1){
-			printf("There is no slice for input block[%"PRIu64"].\n", block_index);
-			return RET_INSUFFICIENT_DATA;
+	{
+		uint64_t unused_count = 0;
+		for (block_index = 0; block_index < block_count; block_index++){
+			if (block_list[block_index].slice == -1){
+				if (par3_ctx->start_packet_count > 1){
+					// Incremental backup chain: blocks of deleted or changed
+					// files are no longer referenced by any current file.
+					block_list[block_index].state |= 32;	// unused block
+					unused_count++;
+					continue;
+				}
+				printf("There is no slice for input block[%"PRIu64"].\n", block_index);
+				return RET_INSUFFICIENT_DATA;
+			}
+		}
+		if ( (unused_count > 0) && (par3_ctx->noise_level >= 1) ){
+			printf("Number of unused input blocks (older backups) = %"PRIu64"\n", unused_count);
 		}
 	}
 
@@ -343,9 +356,12 @@ int calculate_recovery_count(PAR3_CTX *par3_ctx)
 	}
 
 	// Test number of blocks
-	if (par3_ctx->ecc_method & 1){	// Cauchy Reed-Solomon Codes
+	if ( (par3_ctx->ecc_method & 1) || (par3_ctx->ecc_method & 2) ){	// Cauchy or Sparse Random
 		if (par3_ctx->noise_level >= 0){
-			printf("Cauchy Reed-Solomon Codes\n");
+			if (par3_ctx->ecc_method & 2)
+				printf("Sparse Random Matrix Codes\n");
+			else
+				printf("Cauchy Reed-Solomon Codes\n");
 		}
 
 		// When max recovery block count is set, it must be equal or larger than creating recovery blocks.
@@ -357,8 +373,21 @@ int calculate_recovery_count(PAR3_CTX *par3_ctx)
 		if (total_count < par3_ctx->block_count + par3_ctx->max_recovery_block)
 			total_count = par3_ctx->block_count + par3_ctx->max_recovery_block;
 		if (total_count > 65536){
-			printf("Total block count %"PRIu64" are too many.\n", total_count);
-			return RET_LOGIC_ERROR;
+			if ( (par3_ctx->ecc_method & 2) && (par3_ctx->ecc_extended != 0) ){
+				// Extended block count: sparse random matrices are not bound
+				// to the Galois field size. Keep a sane implementation limit.
+				if (total_count > (1 << 24)){
+					printf("Total block count %"PRIu64" are too many even for extended mode (max %u).\n", total_count, 1 << 24);
+					return RET_LOGIC_ERROR;
+				}
+				if (par3_ctx->noise_level >= 0)
+					printf("Extended block count mode (PAR SPX): %"PRIu64" total blocks.\n", total_count);
+			} else {
+				printf("Total block count %"PRIu64" are too many.\n", total_count);
+				if (par3_ctx->ecc_method & 2)
+					printf("Use option -e2x (extended block count) to exceed 65536 blocks with Sparse codes.\n");
+				return RET_LOGIC_ERROR;
+			}
 		}
 
 		if (par3_ctx->noise_level >= 0){

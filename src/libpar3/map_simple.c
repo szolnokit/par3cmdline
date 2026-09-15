@@ -88,6 +88,11 @@ int map_input_block_simple(PAR3_CTX *par3_ctx)
 	slice_index = 0;
 	file_p = par3_ctx->input_file_list;
 	for (num = 0; num < input_file_count; num++){
+		if (file_p->state & 0x01000000){	// Inherited from parent backup: no new blocks.
+			file_p->chunk_num = 0;
+			file_p++;
+			continue;
+		}
 		blake3_hasher_init(&hasher);
 		if (file_p->size == 0){	// Skip empty files.
 			blake3_hasher_finalize(&hasher, file_p->hash, 16);
@@ -358,7 +363,8 @@ int map_input_block_simple(PAR3_CTX *par3_ctx)
 	par3_ctx->chunk_count = chunk_index;
 
 	// Check actual number of slice info
-	if (slice_index != block_count){
+	// (fewer slices than the estimate is possible with inherited files)
+	if (slice_index > block_count){
 		printf("Number of input file slices = %"PRIu64" (max %"PRIu64")\n", slice_index, block_count);
 		return RET_LOGIC_ERROR;
 	}
@@ -370,12 +376,17 @@ int map_input_block_simple(PAR3_CTX *par3_ctx)
 		par3_ctx->block_count = block_count;
 
 		// realloc
-		block_p = realloc(par3_ctx->block_list, sizeof(PAR3_BLOCK_CTX) * block_count);
-		if (block_p == NULL){
-			perror("Failed to re-allocate memory for input blocks");
-			return RET_MEMORY_ERROR;
+		if (block_count > 0){
+			block_p = realloc(par3_ctx->block_list, sizeof(PAR3_BLOCK_CTX) * block_count);
+			if (block_p == NULL){
+				perror("Failed to re-allocate memory for input blocks");
+				return RET_MEMORY_ERROR;
+			}
+			par3_ctx->block_list = block_p;
+		} else {
+			free(par3_ctx->block_list);
+			par3_ctx->block_list = NULL;
 		}
-		par3_ctx->block_list = block_p;
 	}
 	if (par3_ctx->noise_level >= 0){
 		printf("Actual block count = %"PRIu64", Tail packing = %u\n", block_count, num_pack);
@@ -415,6 +426,11 @@ int map_chunk_tail(PAR3_CTX *par3_ctx)
 	chunk_index = 0;
 	file_p = par3_ctx->input_file_list;
 	for (num = 0; num < input_file_count; num++){
+		if (file_p->state & 0x01000000){	// Inherited from parent backup: no new blocks.
+			file_p->chunk_num = 0;
+			file_p++;
+			continue;
+		}
 		blake3_hasher_init(&hasher);
 		if (file_p->size == 0){	// Skip empty files.
 			blake3_hasher_finalize(&hasher, file_p->hash, 16);
@@ -547,6 +563,11 @@ int map_input_block_trial(PAR3_CTX *par3_ctx)
 	slice_index = 0;
 	file_p = par3_ctx->input_file_list;
 	for (num = 0; num < input_file_count; num++){
+		if (file_p->state & 0x01000000){	// Inherited from parent backup: no new blocks.
+			file_p->chunk_num = 0;
+			file_p++;
+			continue;
+		}
 		if (file_p->size == 0){	// Skip empty files.
 			file_p++;
 			continue;
@@ -706,7 +727,8 @@ int map_input_block_trial(PAR3_CTX *par3_ctx)
 	par3_ctx->chunk_count = chunk_index;
 
 	// Check actual number of slice info
-	if (slice_index != block_count){
+	// (fewer slices than the estimate is possible with inherited files)
+	if (slice_index > block_count){
 		printf("Number of input file slices = %"PRIu64" (max %"PRIu64")\n", slice_index, block_count);
 		return RET_LOGIC_ERROR;
 	}
@@ -718,12 +740,17 @@ int map_input_block_trial(PAR3_CTX *par3_ctx)
 		par3_ctx->block_count = block_count;
 
 		// realloc
-		block_p = realloc(par3_ctx->block_list, sizeof(PAR3_BLOCK_CTX) * block_count);
-		if (block_p == NULL){
-			perror("Failed to re-allocate memory for input blocks");
-			return RET_MEMORY_ERROR;
+		if (block_count > 0){
+			block_p = realloc(par3_ctx->block_list, sizeof(PAR3_BLOCK_CTX) * block_count);
+			if (block_p == NULL){
+				perror("Failed to re-allocate memory for input blocks");
+				return RET_MEMORY_ERROR;
+			}
+			par3_ctx->block_list = block_p;
+		} else {
+			free(par3_ctx->block_list);
+			par3_ctx->block_list = NULL;
 		}
-		par3_ctx->block_list = block_p;
 	}
 	if (par3_ctx->noise_level >= 0){
 		printf("Actual block count = %"PRIu64", Tail packing = %u\n", block_count, num_pack);

@@ -184,17 +184,29 @@ int make_start_packet(PAR3_CTX *par3_ctx, int flag_trial)
 
 	// Set initial value temporary.
 	tmp_p = par3_ctx->start_packet + 48;
-	// At this time, "incremental backup" feature isn't made.
-	memset(tmp_p, 0, 24);	// When there is no parent, fill zeros.
+	// Incremental backup: parent's InputSetID and Root packet checksum (or zeros).
+	if (mem_or8(par3_ctx->parent_set_id) != 0){
+		memcpy(tmp_p, par3_ctx->parent_set_id, 8);
+		memcpy(tmp_p + 8, par3_ctx->parent_root_hash, 16);
+		if (mem_or16(par3_ctx->parent_root_hash) == 0){
+			printf("Parent Root packet checksum is missing for incremental backup.\n");
+			return RET_LOGIC_ERROR;
+		}
+	} else {
+		memset(tmp_p, 0, 24);	// When there is no parent, fill zeros.
+	}
 	tmp_p += 24;
 	memcpy(tmp_p, &(par3_ctx->block_size), 8);	// Block size
 	tmp_p += 8;
 	// Galois Field is varied by using Error Correction Codes.
-	if (par3_ctx->ecc_method & 1){	// Reed-Solomon Erasure Codes with Cauchy Matrix
-		if ( ( (par3_ctx->block_count > 128) && (par3_ctx->max_recovery_block == 0) )
+	if ( (par3_ctx->ecc_method & 1) || (par3_ctx->ecc_method & 2) ){	// Cauchy or Sparse Random Matrix
+		if ( (par3_ctx->ecc_extended != 0)
+				|| ( (par3_ctx->block_count > 128) && (par3_ctx->max_recovery_block == 0) )
 				|| (par3_ctx->block_count + par3_ctx->first_recovery_block + par3_ctx->recovery_block_count > 256)
 				|| (par3_ctx->block_count + par3_ctx->max_recovery_block > 256) ){
 			// When there are 129 or more input blocks, use 16-bit Galois Field (0x1100B).
+			// Extended block count (PAR SPX) always uses the 16-bit field for
+			// matrix element values; block indices are plain integers there.
 			par3_ctx->galois_poly = 0x1100B;
 			par3_ctx->gf_size = 2;
 			tmp_p[0] = 2;
@@ -240,6 +252,43 @@ int make_start_packet(PAR3_CTX *par3_ctx, int flag_trial)
 				tmp_p[1] = 0x2D;
 				tmp_p[2] = 0x00;
 			}
+		}
+	}
+	// Incremental backup: the spec requires the same Galois field as the parent.
+	if ( (mem_or8(par3_ctx->parent_set_id) != 0) && (par3_ctx->parent_gf_size != 0) ){
+		if (par3_ctx->parent_gf_size > 2){
+			printf("Parent Galois field size (%u) is not supported.\n", par3_ctx->parent_gf_size);
+			return RET_LOGIC_ERROR;
+		}
+		if (par3_ctx->ecc_method & 8){	// FFT needs its own polynomial (Leopard-RS)
+			if (par3_ctx->galois_poly != par3_ctx->parent_galois_poly){
+				printf("FFT codes cannot reuse the parent's Galois field (0x%X).\n", par3_ctx->parent_galois_poly);
+				printf("Use -e1 (Cauchy) or -e2 (Sparse) for incremental backup.\n");
+				return RET_LOGIC_ERROR;
+			}
+		} else if (par3_ctx->ecc_method & 3){	// Cauchy / Sparse work with any generator
+			// Count the parent's blocks too: indices are shared across the chain.
+			uint64_t base_count = par3_ctx->block_count + par3_ctx->block_index_offset;
+			uint64_t total_count = base_count + par3_ctx->first_recovery_block + par3_ctx->recovery_block_count;
+			if (total_count < base_count + par3_ctx->max_recovery_block)
+				total_count = base_count + par3_ctx->max_recovery_block;
+			if ( (par3_ctx->parent_gf_size == 1) && (total_count > 256) ){
+				printf("Too many blocks (%"PRIu64") for the parent's 8-bit Galois field.\n", total_count);
+				printf("Use a larger block size to reduce the block count.\n");
+				return RET_LOGIC_ERROR;
+			}
+			if ( (par3_ctx->parent_gf_size == 2) && (total_count > 65536)
+					&& !( (par3_ctx->ecc_method & 2) && (par3_ctx->ecc_extended != 0) ) ){
+				printf("Too many blocks (%"PRIu64") for the parent's 16-bit Galois field.\n", total_count);
+				printf("Use a larger block size to reduce the block count.\n");
+				return RET_LOGIC_ERROR;
+			}
+			par3_ctx->gf_size = par3_ctx->parent_gf_size;
+			par3_ctx->galois_poly = par3_ctx->parent_galois_poly;
+			tmp_p[0] = par3_ctx->gf_size;
+			tmp_p[1] = (uint8_t)(par3_ctx->galois_poly & 0xFF);
+			if (par3_ctx->gf_size == 2)
+				tmp_p[2] = (uint8_t)((par3_ctx->galois_poly >> 8) & 0xFF);
 		}
 	}
 	if (par3_ctx->gf_size == 0){	// When there is no input blocks, no need to set Galois Field.
@@ -320,7 +369,20 @@ int make_matrix_packet(PAR3_CTX *par3_ctx)
 	if (par3_ctx->ecc_method & 1){	// Cauchy Matrix Packet
 		tmp_p = par3_ctx->matrix_packet + 48;
 		// If the encoding client wants to compute recovery data for every input block, they use the values 0 and 0.
-		if (par3_ctx->max_recovery_block == 0){
+		if (par3_ctx->block_index_offset > 0){
+			// Incremental backup: recovery data covers only the child's own blocks.
+			uint64_t range_value;
+			range_value = par3_ctx->block_index_offset;	// index of first input block
+			memcpy(tmp_p, &range_value, 8);
+			tmp_p += 8;
+			range_value = par3_ctx->block_index_offset + par3_ctx->block_count;	// index of last input block + 1
+			memcpy(tmp_p, &range_value, 8);
+			tmp_p += 8;
+			memset(tmp_p, 0, 8);
+			if (par3_ctx->max_recovery_block > 0)
+				memcpy(tmp_p, &(par3_ctx->max_recovery_block), 8);
+			tmp_p += 8;
+		} else if (par3_ctx->max_recovery_block == 0){
 			// If the number of rows is unknown, the hint is set to zero.
 			memset(tmp_p, 0, 24);	// Thus, three items are zero.
 			tmp_p += 24;
@@ -335,24 +397,67 @@ int make_matrix_packet(PAR3_CTX *par3_ctx)
 		packet_size = 72;
 		make_packet_header(par3_ctx->matrix_packet, packet_size, par3_ctx->set_id, "PAR CAU\0", 1);
 
-
-/*
 	} else if (par3_ctx->ecc_method & 2){	// Sparse Random Matrix Packet
+		uint64_t max_rec, nnz, seed;
+
 		par3_ctx->ecc_method = 2;
 		tmp_p = par3_ctx->matrix_packet + 48;
-		// How to know maximum number of recovery blocks ?
-		memset(tmp_p, 0, 24);
-		tmp_p += 24;
-		// How to select number of non-zero elements per input block ?
-		// Is it a density rate against number of input blocks ? such like 1%
-		
-		// How is random number generator seed ?
-		// Is it ok to set a fixed value always ?
-		// Start Packet has unique random number already.
-
+		if (par3_ctx->block_index_offset > 0){
+			// Incremental backup: recovery data covers only the child's own blocks.
+			uint64_t range_value;
+			range_value = par3_ctx->block_index_offset;	// index of first input block
+			memcpy(tmp_p, &range_value, 8);
+			range_value = par3_ctx->block_index_offset + par3_ctx->block_count;	// index of last input block + 1
+			memcpy(tmp_p + 8, &range_value, 8);
+		} else {
+			memset(tmp_p, 0, 16);	// first/last input block = full range
+		}
+		tmp_p += 16;
+		max_rec = par3_ctx->max_recovery_block;
+		if (max_rec < par3_ctx->first_recovery_block + par3_ctx->recovery_block_count)
+			max_rec = par3_ctx->first_recovery_block + par3_ctx->recovery_block_count;
+		if (max_rec == 0)
+			max_rec = par3_ctx->recovery_block_count;
+		if (max_rec == 0)
+			max_rec = 1;
+		memcpy(tmp_p, &max_rec, 8);
+		tmp_p += 8;
+		if (par3_ctx->ecc_extended != 0){
+			/* Extended block count: cap density so encode work stays
+			   proportional to the data size (nnz ~ log2 of recovery count). */
+			uint64_t bits = 0, v = max_rec;
+			while (v > 1){
+				v >>= 1;
+				bits++;
+			}
+			nnz = bits + 8;
+			if (nnz < 12)
+				nnz = 12;
+		} else {
+			/* ~10% density; at least 8 non-zeros for reliable inversion near
+			   full capacity (raises rank probability of the decode submatrix). */
+			nnz = (max_rec + 9) / 10;
+			if (nnz < 8)
+				nnz = 8;
+		}
+		if (nnz > max_rec)
+			nnz = max_rec;
+		memcpy(tmp_p, &nnz, 8);
+		tmp_p += 8;
+		/* Seed from InputSetID for reproducibility across encode/decode. */
+		memcpy(&seed, par3_ctx->set_id, 8);
+		memcpy(tmp_p, &seed, 8);
+		tmp_p += 8;
+		par3_ctx->sparse_max_recovery = max_rec;
+		par3_ctx->sparse_nnz = nnz;
+		par3_ctx->sparse_seed = seed;
 		packet_size = 88;
-		make_packet_header(par3_ctx->matrix_packet, packet_size, par3_ctx->set_id, "PAR SPA\0", 1);
-*/
+		// Extended block count uses its own packet type: clients that do not
+		// support it will not find a usable matrix (verify still works).
+		if (par3_ctx->ecc_extended != 0)
+			make_packet_header(par3_ctx->matrix_packet, packet_size, par3_ctx->set_id, "PAR SPX\0", 1);
+		else
+			make_packet_header(par3_ctx->matrix_packet, packet_size, par3_ctx->set_id, "PAR SPA\0", 1);
 
 	} else if (par3_ctx->ecc_method & 8){	// FFT Matrix Packet
 		tmp_p = par3_ctx->matrix_packet + 48;
@@ -553,6 +658,13 @@ int make_file_packet(PAR3_CTX *par3_ctx)
 		file_p = par3_ctx->input_file_list;
 		chunk_p = par3_ctx->chunk_list;
 		while (num > 0){
+			if (file_p->state & 0x01000000){
+				// Inherited from parent backup: the parent's File Packet is
+				// reused (its checksum is already in file_p->chk).
+				file_p++;
+				num--;
+				continue;
+			}
 			// offset of this packet
 			file_p->offset = tmp_p - par3_ctx->file_packet;
 			packet_size = 48;
@@ -615,13 +727,15 @@ int make_file_packet(PAR3_CTX *par3_ctx)
 						packet_size += 8;
 
 					} else {	// Protected Chunk Description
+						uint64_t abs_index;
 						// length of protected chunk
 						total_size += chunk_p[chunk_index].size;
 						memcpy(tmp_p + packet_size, &(chunk_p[chunk_index].size), 8);
 						packet_size += 8;
 						if (chunk_p[chunk_index].size >= block_size){
 							// index of first input block holding chunk
-							memcpy(tmp_p + packet_size, &(chunk_p[chunk_index].block), 8);
+							abs_index = chunk_p[chunk_index].block + par3_ctx->block_index_offset;
+							memcpy(tmp_p + packet_size, &abs_index, 8);
 							packet_size += 8;
 							//printf("chunk[%2u], block[%2"PRIu64"], %s\n", chunk_index, chunk_p[chunk_index].index, file_p->name);
 						}
@@ -634,7 +748,8 @@ int make_file_packet(PAR3_CTX *par3_ctx)
 							memcpy(tmp_p + packet_size, chunk_p[chunk_index].tail_hash, 16);
 							packet_size += 16;
 							// index of block holding tail
-							memcpy(tmp_p + packet_size, &(chunk_p[chunk_index].tail_block), 8);
+							abs_index = chunk_p[chunk_index].tail_block + par3_ctx->block_index_offset;
+							memcpy(tmp_p + packet_size, &abs_index, 8);
 							packet_size += 8;
 							// offset of tail inside block
 							memcpy(tmp_p + packet_size, &(chunk_p[chunk_index].tail_offset), 8);
@@ -688,12 +803,17 @@ int make_file_packet(PAR3_CTX *par3_ctx)
 		}
 
 		if (total_packet_size < file_alloc_size){	// Reduce memory usage to used size.
-			tmp_p = realloc(par3_ctx->file_packet, total_packet_size);
-			if (tmp_p == NULL){
-				perror("Failed to re-allocate memory for File Packet");
-				return RET_MEMORY_ERROR;
+			if (total_packet_size > 0){
+				tmp_p = realloc(par3_ctx->file_packet, total_packet_size);
+				if (tmp_p == NULL){
+					perror("Failed to re-allocate memory for File Packet");
+					return RET_MEMORY_ERROR;
+				}
+				par3_ctx->file_packet = tmp_p;
+			} else {	// All files were inherited from the parent backup.
+				free(par3_ctx->file_packet);
+				par3_ctx->file_packet = NULL;
 			}
-			par3_ctx->file_packet = tmp_p;
 		}
 		par3_ctx->file_packet_size = total_packet_size;
 		par3_ctx->file_packet_count = packet_count;
@@ -703,12 +823,18 @@ int make_file_packet(PAR3_CTX *par3_ctx)
 	}
 
 	// Allocate buffer for children's checksums.
-	alloc_size = packet_count + par3_ctx->input_dir_count;
+	// Use the file count (not the packet count): inherited files reuse the
+	// parent's File Packet but still appear in the children checksum lists.
+	alloc_size = (size_t)par3_ctx->input_file_count + par3_ctx->input_dir_count;
 	if (alloc_size < 1)
 		alloc_size = 1;
 	//printf("Possible number of File Packet and Diretory Packet = %zu\n", alloc_size);
 	alloc_size *= 16;	// size of total checksums
 	chk_p = malloc(alloc_size);
+	if (chk_p == NULL){
+		perror("Failed to allocate memory for children's checksums");
+		return RET_MEMORY_ERROR;
+	}
 
 	// Number of Directory Packet may be same as number of input directories.
 	// When there are same empty folder in different directories, there are less packets.
@@ -946,8 +1072,11 @@ int make_file_packet(PAR3_CTX *par3_ctx)
 	tmp_p = par3_ctx->root_packet;
 	packet_count = 0;
 	packet_size = 48;
-	// Lowest unused index for input blocks.
-	memcpy(tmp_p + packet_size, &(par3_ctx->block_count), 8);
+	{	// Lowest unused index for input blocks.
+		// For incremental backup this includes the parent's blocks, too.
+		uint64_t total_block_count = par3_ctx->block_count + par3_ctx->block_index_offset;
+		memcpy(tmp_p + packet_size, &total_block_count, 8);
+	}
 	packet_size += 8;
 	// attributes
 	tmp_p[packet_size] = par3_ctx->attribute;
@@ -1112,8 +1241,9 @@ int make_ext_data_packet(PAR3_CTX *par3_ctx)
 	while (block_count > 0){
 		if (block_p->state & 1){	// block of full size data
 			if (write_packet_count == 0){
+				uint64_t abs_index = (uint64_t)find_block_count + par3_ctx->block_index_offset;
 				tmp_p += 48;	// skip packet header
-				memcpy(tmp_p, &find_block_count, 8);	// Index of the first input block
+				memcpy(tmp_p, &abs_index, 8);	// Index of the first input block
 				tmp_p += 8;
 			}
 			memcpy(tmp_p, &(block_p->crc), 8);	// rolling hash

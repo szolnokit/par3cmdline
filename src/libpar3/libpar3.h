@@ -97,6 +97,14 @@ typedef struct {
 	uint64_t crc;	// CRC-64 of block
 } PAR3_CMP_CTX;
 
+// Parent input file info for incremental backup (create side)
+typedef struct _PAR3_PARENT_FILE {
+	char *name;			// relative path (own copy)
+	uint64_t size;
+	uint8_t hash[16];	// BLAKE3 fingerprint of the protected data
+	uint8_t chk[16];	// checksum of the parent's File Packet
+} PAR3_PARENT_FILE;
+
 typedef struct {
 	uint64_t id;		// InputSetID
 	uint8_t root[16];	// checksum from Root packet
@@ -142,14 +150,65 @@ typedef struct {
 	uint8_t set_id[8];	// InputSetID
 	uint8_t attribute;	// attributes in Root Packet
 	uint8_t gf_size;	// The size of the Galois field in bytes
+	uint8_t ecc_extended;	// 1 = extended block count (Sparse "PAR SPX" packet)
 
 	int galois_poly;		// The generator polynomial of the Galois field
 	void *galois_table;		// Pointer of tables for (finite) galois field arithmetic
 	uint32_t ecc_method;	// Bit flag: 1 = Reed-Solomon Erasure Codes with Cauchy Matrix
-							//           2 = Erasure Codes with Sparse Random Matrix (no support yet)
+							//           2 = Erasure Codes with Sparse Random Matrix
 							//           4 = LDPC (no support yet)
 							//           8 = FFT based Reed-Solomon Codes
 							//      0x8000 = Keep all recovery blocks or lost blocks on memory
+
+	// Incremental backup: parent Start Packet fields (zeros = none)
+	uint8_t parent_set_id[8];
+	uint8_t parent_root_hash[16];
+	uint8_t parent_gf_size;		// parent's Galois field size (child must match)
+	int parent_galois_poly;	// parent's Galois field generator
+	char parent_filename[_MAX_PATH];
+
+	// Incremental backup: retained parent packets and file table (create side)
+	uint64_t parent_block_count;	// parent's total input block count = child's first block index
+	uint8_t *parent_start_packet;	size_t parent_start_packet_size;	uint32_t parent_start_packet_count;
+	uint8_t *parent_file_packet;	size_t parent_file_packet_size;		uint32_t parent_file_packet_count;
+	uint8_t *parent_ext_packet;		size_t parent_ext_packet_size;		uint32_t parent_ext_packet_count;
+	uint8_t *parent_fs_packet;		size_t parent_fs_packet_size;		uint32_t parent_fs_packet_count;
+	uint32_t parent_file_count;
+	PAR3_PARENT_FILE *parent_file_list;
+
+	// Index of the child set's first own input block (0 = not incremental)
+	uint64_t block_index_offset;
+
+	// Input block range covered by the selected Matrix Packet (decode side).
+	// last == 0 means the full range (every input block).
+	uint64_t matrix_first_block;
+	uint64_t matrix_last_block;
+
+	// Sparse Random Matrix parameters (from SPA packet / create options)
+	uint64_t sparse_max_recovery;
+	uint64_t sparse_nnz;		// non-zero elements per input block
+	uint64_t sparse_seed;
+	void *sparse_table;			// cached generator: input_rows * max_recovery (uint8/uint16)
+
+	// Peeling decoder plan for sparse codes (decode side, 16-bit GF).
+	// Built by rs16_peel_plan; executed by rs_peel_input/recovery/solve.
+	uint8_t use_peel;		// 1 = recover_lost_block uses the peeling decoder
+	int peel_avail;			// number of candidate recovery rows
+	int peel_op_count;		// lost blocks solved directly by peeling
+	int peel_core_count;	// lost blocks solved by the dense core
+	int peel_core_rows_count;	// candidate rows referenced by the core solution
+	int *peel_row_ids;		// [peel_avail] recovery block ids of candidate rows
+	int *peel_rowmap;		// [sparse_max_recovery] recovery id -> candidate row index (-1 = unused)
+	int *peel_col_off;		// CSR by lost column: offsets [lost_count + 1]
+	int *peel_col_row;		// candidate row index per entry
+	uint16_t *peel_col_val;	// matrix element per entry
+	int *peel_op_col;		// [peel_op_count] peel order: lost column index
+	int *peel_op_row;		// [peel_op_count] peel order: solving candidate row
+	int *peel_core_cols;	// [peel_core_count] lost column indices
+	int *peel_core_rows;	// [peel_core_rows_count] candidate row indices
+	uint16_t *peel_core_inv;	// [peel_core_count * peel_core_rows_count] solution weights
+	uint8_t *peel_residual;	// [peel_avail * peel_region] residual buffers
+	size_t peel_region;		// aligned region size of one residual buffer
 
 	uint32_t interleave;	// Number of interleaving (Number of cohorts = this value + 1)
 	uint32_t *lost_list;	// List for lost blocks and recovery blocks for every cohorts
@@ -259,6 +318,7 @@ int sort_input_set(PAR3_CTX *par3_ctx);
 // Add text in Creator Packet or Comment Packet
 int add_creator_text(PAR3_CTX *par3_ctx, char *text);
 int add_comment_text(PAR3_CTX *par3_ctx, char *text);
+int load_parent_backup(PAR3_CTX *par3_ctx, const char *parent_path);
 
 // For creation
 int par3_trial(PAR3_CTX *par3_ctx, char *temp_path);

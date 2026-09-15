@@ -33,6 +33,71 @@ plank@cs.utk.edu
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "simd.h"
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define PAR3_X86 1
+#include <immintrin.h>
+#endif
+
+#ifdef PAR3_X86
+#if defined(__GNUC__) && !defined(__clang__)
+#define TARGET_SSSE3 __attribute__((target("ssse3")))
+#define TARGET_AVX2 __attribute__((target("avx2")))
+#elif defined(__clang__)
+#define TARGET_SSSE3 __attribute__((target("ssse3")))
+#define TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define TARGET_SSSE3
+#define TARGET_AVX2
+#endif
+
+/*
+ * PSHUFB based GF(2^8) region multiply (classic 4-bit split tables):
+ *   product(b) = TL[b & 15] ^ TH[b >> 4]
+ * tbl[0..15] = TL, tbl[16..31] = TH.
+ */
+TARGET_SSSE3
+static size_t gf8_region_mul_ssse3(const uint8_t *tbl, const uint8_t *src, uint8_t *dst, size_t nbytes, int add)
+{
+	__m128i tl = _mm_loadu_si128((const __m128i *)tbl);
+	__m128i th = _mm_loadu_si128((const __m128i *)(tbl + 16));
+	__m128i mask = _mm_set1_epi8(0x0F);
+	size_t i;
+
+	for (i = 0; i + 16 <= nbytes; i += 16){
+		__m128i v = _mm_loadu_si128((const __m128i *)(src + i));
+		__m128i lo = _mm_and_si128(v, mask);
+		__m128i hi = _mm_and_si128(_mm_srli_epi64(v, 4), mask);
+		__m128i p = _mm_xor_si128(_mm_shuffle_epi8(tl, lo), _mm_shuffle_epi8(th, hi));
+		if (add)
+			p = _mm_xor_si128(p, _mm_loadu_si128((const __m128i *)(dst + i)));
+		_mm_storeu_si128((__m128i *)(dst + i), p);
+	}
+	return i;	// number of bytes processed
+}
+
+TARGET_AVX2
+static size_t gf8_region_mul_avx2(const uint8_t *tbl, const uint8_t *src, uint8_t *dst, size_t nbytes, int add)
+{
+	__m256i tl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)tbl));
+	__m256i th = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(tbl + 16)));
+	__m256i mask = _mm256_set1_epi8(0x0F);
+	size_t i;
+
+	for (i = 0; i + 32 <= nbytes; i += 32){
+		__m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+		__m256i lo = _mm256_and_si256(v, mask);
+		__m256i hi = _mm256_and_si256(_mm256_srli_epi64(v, 4), mask);
+		__m256i p = _mm256_xor_si256(_mm256_shuffle_epi8(tl, lo), _mm256_shuffle_epi8(th, hi));
+		if (add)
+			p = _mm256_xor_si256(p, _mm256_loadu_si256((const __m256i *)(dst + i)));
+		_mm256_storeu_si256((__m256i *)(dst + i), p);
+	}
+	return i;	// number of bytes processed
+}
+#endif	// PAR3_X86
+
 
 // Create tables for 8-bit Galois Field
 // Return main pointer of tables.
@@ -193,20 +258,42 @@ void gf8_region_multiply(uint8_t *galois_log_table,
 	} else {
 		uint8_t prod;
 		uint8_t *galois_mult_table;
+		int add_mode;
 
 		galois_mult_table = galois_log_table + 256 * 2;
 		galois_mult_table += multby * 256;	// Shift mult_table offset by multby
 
-		if ( (r2 == NULL) || (add == 0) ) {
-			if (r2 == NULL)
-				r2 = region;
+		// Original semantics: r2 == NULL means multiply in place (overwrite).
+		add_mode = (add != 0) && (r2 != NULL);
+		if (r2 == NULL)
+			r2 = region;
 
-			for (i = 0; i < nbytes; i++) {
+		i = 0;
+#ifdef PAR3_X86
+		if (nbytes >= 64){
+			int simd = par3_simd_level();
+			if (simd >= 1){
+				uint8_t tbl[32];
+				int k;
+				for (k = 0; k < 16; k++){
+					tbl[k]      = galois_mult_table[k];
+					tbl[16 + k] = galois_mult_table[k << 4];
+				}
+				if (simd >= 2){
+					i = gf8_region_mul_avx2(tbl, region, r2, nbytes, add_mode);
+				} else {
+					i = gf8_region_mul_ssse3(tbl, region, r2, nbytes, add_mode);
+				}
+			}
+		}
+#endif
+		if (add_mode == 0) {
+			for (; i < nbytes; i++) {
 				prod = galois_mult_table[ region[i] ];
 				r2[i] = prod;
 			}
 		} else {
-			for (i = 0; i < nbytes; i++) {
+			for (; i < nbytes; i++) {
 				prod = galois_mult_table[ region[i] ];
 				r2[i] ^= prod;
 			}

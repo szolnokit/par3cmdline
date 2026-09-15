@@ -6,6 +6,18 @@
 #include <string.h>
 
 
+// Offset of parent InputSetID from the start of a Start packet.
+// Current format: body begins with parent InputSetID at +48.
+// Old format (total size >= 89): an 8-byte random field precedes the parent fields.
+static size_t start_packet_parent_id_offset(uint64_t packet_size)
+{
+	size_t off = 48;
+	if (packet_size >= 89)
+		off += 8;
+	return off;
+}
+
+
 // 0 = no packet yet, 1 = the packet exists already
 int check_packet_exist(uint8_t *buf, size_t buf_size, uint8_t *packet, uint64_t packet_size)
 {
@@ -250,6 +262,36 @@ int add_found_packet(PAR3_CTX *par3_ctx, uint8_t *packet)
 		}
 
 	} else if (memcmp(packet_type, "PAR FFT\0", 8) == 0){	// FFT Matrix Packet
+		if (par3_ctx->matrix_packet == NULL){
+			par3_ctx->matrix_packet = malloc(packet_size);
+			if (par3_ctx->matrix_packet == NULL){
+				perror("Failed to allocate memory for Matrix Packet");
+				return RET_MEMORY_ERROR;
+			}
+			memcpy(par3_ctx->matrix_packet, packet, packet_size);
+			par3_ctx->matrix_packet_size = packet_size;
+			par3_ctx->matrix_packet_count = 1;
+		} else if (check_packet_exist(par3_ctx->matrix_packet, par3_ctx->matrix_packet_size, packet, packet_size) == 1){
+			// If there is the packet already, just exit.
+			return -1;
+		} else {
+			// Add this packet after other packets.
+			tmp_p = realloc(par3_ctx->matrix_packet, par3_ctx->matrix_packet_size + packet_size);
+			if (tmp_p == NULL){
+				perror("Failed to re-allocate memory for Matrix Packet");
+				return RET_MEMORY_ERROR;
+			}
+			par3_ctx->matrix_packet = tmp_p;
+			memcpy(par3_ctx->matrix_packet + par3_ctx->matrix_packet_size, packet, packet_size);
+			par3_ctx->matrix_packet_size += packet_size;
+			par3_ctx->matrix_packet_count++;
+		}
+
+	// Sparse Random Matrix Packet (SPX = extended block count variant)
+	} else if ( (memcmp(packet_type, "PAR SPA\0", 8) == 0)
+				|| (memcmp(packet_type, "PAR SPX\0", 8) == 0) ){
+		if (memcmp(packet_type, "PAR SPX\0", 8) == 0)
+			par3_ctx->ecc_extended = 1;
 		if (par3_ctx->matrix_packet == NULL){
 			par3_ctx->matrix_packet = malloc(packet_size);
 			if (par3_ctx->matrix_packet == NULL){
@@ -740,8 +782,12 @@ int check_packet_set(PAR3_CTX *par3_ctx)
 	} else {	// When there are multiple Start Packets, test "incremental backup".
 		uint8_t *tmp_p;
 		int i, id_count;
-		size_t max, offset, packet_size;
-		uint64_t *id_list, parent_id, this_id;
+		size_t max, offset;
+		uint64_t *id_list, parent_id, this_id, packet_size, parent_off;
+
+		if (par3_ctx->noise_level >= 1){
+			printf("Multiple Start Packets found; reading PAR3 Set chain (incremental backup).\n");
+		}
 
 		id_list = malloc(sizeof(uint64_t) * par3_ctx->start_packet_count);
 		if (id_list == NULL){
@@ -753,31 +799,34 @@ int check_packet_set(PAR3_CTX *par3_ctx)
 		id_count = 0;
 		tmp_p = par3_ctx->start_packet;
 		max = par3_ctx->start_packet_size;
+		memcpy(&packet_size, tmp_p + 24, 8);
+		parent_off = start_packet_parent_id_offset(packet_size);
 		memcpy(&this_id, tmp_p + 32, 8);
-		memcpy(&parent_id, tmp_p + 48 + 8, 8);
+		memcpy(&parent_id, tmp_p + parent_off, 8);
 		memcpy(id_list + id_count, &this_id, 8);
 		id_count++;
 
 		if (parent_id == 0){	// This packet is the ancestor of PAR3 Sets.
 			// search descendant Sets
-			while (parent_id == 0){
+			int found = 1;
+			while ( (found != 0) && (id_count < (int)par3_ctx->start_packet_count) ){
+				found = 0;
 				offset = 0;
 				while (offset < max){
-					// check parent's SetID
-					if (memcmp(&this_id, tmp_p + offset + 48 + 8, 8) == 0){
+					memcpy(&packet_size, tmp_p + offset + 24, 8);
+					parent_off = start_packet_parent_id_offset(packet_size);
+					// Search a Start Packet whose parent is this Set.
+					if ( (memcmp(&this_id, tmp_p + offset + parent_off, 8) == 0)
+							&& (memcmp(&this_id, tmp_p + offset + 32, 8) != 0) ){
 						memcpy(&this_id, tmp_p + offset + 32, 8);
 						memcpy(id_list + id_count, &this_id, 8);
 						id_count++;
-
-						parent_id = 0;	// search child again
+						found = 1;	// search the next descendant
 						break;
-					} else {
-						parent_id = 1;
 					}
 
 					// goto next packet
-					memcpy(&packet_size, tmp_p + offset + 24, 8);
-					offset += packet_size;
+					offset += (size_t)packet_size;
 				}
 			}
 			// use the last descendant's SetID
@@ -788,24 +837,29 @@ int check_packet_set(PAR3_CTX *par3_ctx)
 			memcpy(par3_ctx->set_id, &this_id, 8);
 
 			// search ancestor Sets
-			while (parent_id != 0){
+			while ( (parent_id != 0) && (id_count < (int)par3_ctx->start_packet_count) ){
+				int found = 0;
 				offset = 0;
 				while (offset < max){
-					// check another SetID
+					memcpy(&packet_size, tmp_p + offset + 24, 8);
+					parent_off = start_packet_parent_id_offset(packet_size);
+					// Search the Start Packet of the parent Set.
 					if (memcmp(&parent_id, tmp_p + offset + 32, 8) == 0){
 						memcpy(id_list + id_count, &parent_id, 8);
 						id_count++;
 
-						memcpy(&parent_id, tmp_p + offset + 48 + 8, 8);
-						// If parent_id isn't 0, search parent again.
+						memcpy(&parent_id, tmp_p + offset + parent_off, 8);
+						// If parent_id isn't 0, search the grandparent.
+						found = 1;
 						break;
-					} else {
-						parent_id = 0;
 					}
 
 					// goto next packet
-					memcpy(&packet_size, tmp_p + offset + 24, 8);
-					offset += packet_size;
+					offset += (size_t)packet_size;
+				}
+				if (found == 0){
+					// The ancestor's Start Packet is missing; stop here.
+					parent_id = 0;
 				}
 			}
 		}

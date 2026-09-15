@@ -7,6 +7,7 @@
 #include <math.h>
 
 #include "common.h"
+#include "sparse.h"
 
 
 // recursive search into sub-directories
@@ -1200,9 +1201,40 @@ void par3_release(PAR3_CTX *par3_ctx)
 		free(par3_ctx->matrix);
 		par3_ctx->matrix = NULL;
 	}
+	if (par3_ctx->sparse_table){
+		free(par3_ctx->sparse_table);
+		par3_ctx->sparse_table = NULL;
+	}
+	rs_peel_free(par3_ctx);	// peeling decoder plan (no-op when unused)
 	if (par3_ctx->lost_list){
 		free(par3_ctx->lost_list);
 		par3_ctx->lost_list = NULL;
+	}
+	if (par3_ctx->parent_start_packet){
+		free(par3_ctx->parent_start_packet);
+		par3_ctx->parent_start_packet = NULL;
+	}
+	if (par3_ctx->parent_file_packet){
+		free(par3_ctx->parent_file_packet);
+		par3_ctx->parent_file_packet = NULL;
+	}
+	if (par3_ctx->parent_ext_packet){
+		free(par3_ctx->parent_ext_packet);
+		par3_ctx->parent_ext_packet = NULL;
+	}
+	if (par3_ctx->parent_fs_packet){
+		free(par3_ctx->parent_fs_packet);
+		par3_ctx->parent_fs_packet = NULL;
+	}
+	if (par3_ctx->parent_file_list){
+		uint32_t i;
+		for (i = 0; i < par3_ctx->parent_file_count; i++){
+			if (par3_ctx->parent_file_list[i].name)
+				free(par3_ctx->parent_file_list[i].name);
+		}
+		free(par3_ctx->parent_file_list);
+		par3_ctx->parent_file_list = NULL;
+		par3_ctx->parent_file_count = 0;
 	}
 }
 
